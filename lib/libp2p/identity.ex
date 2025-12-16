@@ -28,4 +28,3 @@ defmodule Libp2p.Identity do
     }
   end
 end
-

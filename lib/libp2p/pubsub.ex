@@ -5,4 +5,3 @@ defmodule Libp2p.Pubsub do
   Target: gossipsub v1.1 with StrictNoSign policy and pluggable message-id.
   """
 end
-

@@ -54,4 +54,3 @@ defmodule Libp2p.Crypto.Secp256k1 do
     :binary.copy(<<0>>, 32 - byte_size(bin)) <> bin
   end
 end
-

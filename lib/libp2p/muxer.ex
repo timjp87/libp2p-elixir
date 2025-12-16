@@ -5,4 +5,3 @@ defmodule Libp2p.Muxer do
   The muxer provides many logical streams over a single secured connection.
   """
 end
-

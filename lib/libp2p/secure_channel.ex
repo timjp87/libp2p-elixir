@@ -6,4 +6,3 @@ defmodule Libp2p.SecureChannel do
   read/write plus authenticated remote identity.
   """
 end
-

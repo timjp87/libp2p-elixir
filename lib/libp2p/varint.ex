@@ -21,4 +21,3 @@ defmodule Libp2p.Varint do
   defp bor(a, b), do: :erlang.bor(a, b)
   defp bsr(a, b), do: :erlang.bsr(a, b)
 end
-

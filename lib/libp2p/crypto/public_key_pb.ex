@@ -40,4 +40,3 @@ defmodule Libp2p.Crypto.PublicKeyPB do
   defp a <<< b, do: bsl(a, b)
   defp a ||| b, do: bor(a, b)
 end
-

@@ -6,4 +6,3 @@ defmodule Libp2p.Transport do
   that feed the libp2p upgrade pipeline (security + muxer).
   """
 end
-

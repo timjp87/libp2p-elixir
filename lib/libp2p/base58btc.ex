@@ -64,4 +64,3 @@ defmodule Libp2p.Base58btc do
   defp count_leading_ones([?1 | rest], n), do: count_leading_ones(rest, n + 1)
   defp count_leading_ones(rest, n), do: {n, rest}
 end
-

@@ -13,8 +13,10 @@ defmodule Libp2p.PeerIdTest do
     id = Identity.generate_secp256k1()
     pid = id.peer_id
 
-    assert byte_size(pid) == 34
-    assert <<0x12, 0x20, _digest::binary-size(32)>> = pid
+    # For secp256k1, the protobuf-encoded public key is <= 42 bytes, so PeerId uses identity multihash.
+    assert byte_size(pid) > 2
+    assert <<0x00, len, rest::binary>> = pid
+    assert byte_size(rest) == len
 
     # formatting roundtrip
     s = PeerId.to_base58(pid)
@@ -29,4 +31,3 @@ defmodule Libp2p.PeerIdTest do
     assert pub2 == pub
   end
 end
-

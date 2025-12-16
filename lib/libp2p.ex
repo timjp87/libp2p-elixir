@@ -1,18 +1,11 @@
 defmodule Libp2p do
   @moduledoc """
-  Documentation for `Libp2p`.
+  Minimal libp2p building blocks (spec-driven).
+
+  This library is intentionally small and explicit. Protocols are implemented as
+  separate modules under `Libp2p.*` so Panacea can compose the exact subset
+  required by Ethereum consensus networking.
+
+  Status: scaffold only. See `Libp2p.Supervisor` (coming) for runtime wiring.
   """
-
-  @doc """
-  Hello world.
-
-  ## Examples
-
-      iex> Libp2p.hello()
-      :world
-
-  """
-  def hello do
-    :world
-  end
 end

@@ -7,6 +7,7 @@ defmodule Libp2p.Crypto.PublicKeyPB do
   - field 2: `Data` (bytes)
   """
 
+  alias Libp2p.Protobuf
   alias Libp2p.Varint
 
   @type key_type :: :rsa | :ed25519 | :secp256k1 | :ecdsa
@@ -31,6 +32,34 @@ defmodule Libp2p.Crypto.PublicKeyPB do
       tag_data <>
       Varint.encode_u64(byte_size(data)) <>
       data
+  end
+
+  @spec decode_public_key(binary()) :: {key_type(), binary()}
+  def decode_public_key(bin) when is_binary(bin) do
+    fields = Protobuf.decode_fields(bin)
+
+    type_num =
+      case Enum.find(fields, fn {n, _w, _v} -> n == 1 end) do
+        {1, 0, v} when is_integer(v) -> v
+        _ -> raise ArgumentError, "missing PublicKey.Type"
+      end
+
+    data =
+      case Enum.find(fields, fn {n, _w, _v} -> n == 2 end) do
+        {2, 2, v} when is_binary(v) -> v
+        _ -> raise ArgumentError, "missing PublicKey.Data"
+      end
+
+    type =
+      case type_num do
+        0 -> :rsa
+        1 -> :ed25519
+        2 -> :secp256k1
+        3 -> :ecdsa
+        other -> raise ArgumentError, "unknown PublicKey.Type enum #{other}"
+      end
+
+    {type, data}
   end
 
   defp bor(a, b), do: :erlang.bor(a, b)

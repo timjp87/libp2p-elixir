@@ -44,13 +44,71 @@ defmodule Libp2p.Crypto.Secp256k1 do
     :crypto.sign(:ecdsa, :sha256, msg, [priv, :secp256k1])
   end
 
+  @doc """
+  Sign per libp2p secp256k1 rules (hash SHA-256; DER; low-S normalization).
+  """
+  @spec sign_bitcoin(privkey(), binary()) :: binary()
+  def sign_bitcoin(priv, msg) when is_binary(priv) and is_binary(msg) do
+    der = :crypto.sign(:ecdsa, :sha256, msg, [priv, :secp256k1])
+    normalize_low_s_der!(der)
+  end
+
   @spec verify(pubkey_uncompressed(), binary(), binary()) :: boolean()
   def verify(pub, msg, sig) when is_binary(pub) and is_binary(msg) and is_binary(sig) do
     :crypto.verify(:ecdsa, :sha256, msg, sig, [pub, :secp256k1])
   end
 
+  @doc """
+  Verify per libp2p secp256k1 rules (hash SHA-256; DER).
+  """
+  @spec verify_bitcoin(pubkey_uncompressed(), binary(), binary()) :: boolean()
+  def verify_bitcoin(pub, msg, der_sig) when is_binary(pub) and is_binary(msg) and is_binary(der_sig) do
+    :crypto.verify(:ecdsa, :sha256, msg, der_sig, [pub, :secp256k1])
+  end
+
   defp left_pad32(bin) do
     if byte_size(bin) > 32, do: raise(ArgumentError, "expected <=32 bytes")
     :binary.copy(<<0>>, 32 - byte_size(bin)) <> bin
+  end
+
+  # secp256k1 curve order
+  @n 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+
+  defp normalize_low_s_der!(der) when is_binary(der) do
+    {r, s} = der_decode_ecdsa_sig!(der)
+    s2 = if s > div(@n, 2), do: @n - s, else: s
+    der_encode_ecdsa_sig(r, s2)
+  end
+
+  defp der_decode_ecdsa_sig!(<<0x30, len, rest::binary>>) when byte_size(rest) == len do
+    {r, rest2} = der_decode_integer!(rest)
+    {s, rest3} = der_decode_integer!(rest2)
+    if rest3 != <<>>, do: raise(ArgumentError, "trailing bytes in DER signature")
+    {r, s}
+  end
+
+  defp der_decode_ecdsa_sig!(_), do: raise(ArgumentError, "invalid DER ECDSA signature")
+
+  defp der_decode_integer!(<<0x02, len, rest::binary>>) do
+    if byte_size(rest) < len, do: raise(ArgumentError, "truncated DER integer")
+    <<int_bytes::binary-size(len), tail::binary>> = rest
+    {:binary.decode_unsigned(int_bytes), tail}
+  end
+
+  defp der_decode_integer!(_), do: raise(ArgumentError, "invalid DER integer")
+
+  defp der_encode_ecdsa_sig(r, s) when is_integer(r) and is_integer(s) and r >= 0 and s >= 0 do
+    r_bin = der_int_bytes(r)
+    s_bin = der_int_bytes(s)
+    seq = <<0x02, byte_size(r_bin), r_bin::binary, 0x02, byte_size(s_bin), s_bin::binary>>
+    <<0x30, byte_size(seq), seq::binary>>
+  end
+
+  defp der_int_bytes(0), do: <<0>>
+
+  defp der_int_bytes(n) do
+    bin = :binary.encode_unsigned(n)
+    # ensure positive INTEGER (prepend 0x00 if msb set)
+    if :binary.at(bin, 0) >= 0x80, do: <<0, bin::binary>>, else: bin
   end
 end

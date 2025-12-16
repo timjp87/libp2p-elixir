@@ -3,8 +3,9 @@ defmodule Libp2p.Noise do
   noise-libp2p secure channel (Noise_XX_25519_ChaChaPoly_SHA256).
 
   This implements the handshake logic defined in `third_party/libp2p_specs/noise/README.md`.
-  It is not yet wired to sockets; it operates on binary messages (the `noise_message`
-  field, excluding the 2-byte length prefix).
+  It is not yet wired to sockets; it operates on binary messages:
+  - during handshake: the `noise_message` field (excluding the 2-byte length prefix)
+  - after handshake: transport messages are AEAD ciphertext (excluding length prefix)
   """
 
   alias Libp2p.Identity
@@ -190,6 +191,39 @@ defmodule Libp2p.Noise do
     {st, {cs1, cs2}}
   end
 
+  # --- transport messages (post-handshake) ---
+  @doc """
+  Encrypt a transport message with a `CipherState`.
+
+  Per Noise message format, the output is `ciphertext || tag` (16 bytes tag).
+  """
+  @spec transport_encrypt(cipher_state(), binary(), binary()) :: {binary(), cipher_state()}
+  def transport_encrypt(%{k: key, n: n} = cs, plaintext, ad \\ <<>>)
+      when is_binary(plaintext) and is_binary(ad) do
+    if key == nil, do: raise(ArgumentError, "cipher state has no key")
+    nonce = <<0::unsigned-little-integer-size(32), n::unsigned-little-integer-size(64)>>
+    {ciphertext, tag} = :crypto.crypto_one_time_aead(:chacha20_poly1305, key, nonce, plaintext, ad, true)
+    {ciphertext <> tag, %{cs | n: n + 1}}
+  end
+
+  @doc """
+  Decrypt a transport message with a `CipherState`.
+  """
+  @spec transport_decrypt(cipher_state(), binary(), binary()) :: {binary(), cipher_state()}
+  def transport_decrypt(%{k: key, n: n} = cs, ciphertext_and_tag, ad \\ <<>>)
+      when is_binary(ciphertext_and_tag) and is_binary(ad) do
+    if key == nil, do: raise(ArgumentError, "cipher state has no key")
+    if byte_size(ciphertext_and_tag) < @tag_len, do: raise(ArgumentError, "truncated transport message")
+    nonce = <<0::unsigned-little-integer-size(32), n::unsigned-little-integer-size(64)>>
+    ct_len = byte_size(ciphertext_and_tag) - @tag_len
+    <<ct::binary-size(ct_len), tag::binary-size(@tag_len)>> = ciphertext_and_tag
+
+    case :crypto.crypto_one_time_aead(:chacha20_poly1305, key, nonce, ct, ad, tag, false) do
+      :error -> raise(ArgumentError, "AEAD decrypt failed")
+      pt -> {pt, %{cs | n: n + 1}}
+    end
+  end
+
   # --- symmetric state helpers (Noise Framework semantics) ---
   defp initialize_symmetric do
     # per Noise: if protocol name shorter than hashlen, pad with zeros; else hash.
@@ -267,7 +301,7 @@ defmodule Libp2p.Noise do
     {t1, t2}
   end
 
-  # --- AEAD ChaCha20-Poly1305 ---
+  # --- AEAD ChaCha20-Poly1305 (handshake encrypt/decrypt) ---
   defp encrypt_with_ad(%{cs: %{k: key, n: n}} = st, ad, plaintext) do
     nonce = <<0::unsigned-little-integer-size(32), n::unsigned-little-integer-size(64)>>
     {ciphertext, tag} = :crypto.crypto_one_time_aead(:chacha20_poly1305, key, nonce, plaintext, ad, true)

@@ -189,4 +189,3 @@ defmodule Libp2p.Yamux.Session do
 
   defp band(a, b), do: :erlang.band(a, b)
 end
-

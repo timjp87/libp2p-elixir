@@ -74,4 +74,3 @@ defmodule Libp2p.Pubsub.RPCPB do
     %{subscriptions: subs, publish: pubs}
   end
 end
-

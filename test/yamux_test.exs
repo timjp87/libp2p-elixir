@@ -32,4 +32,3 @@ defmodule Libp2p.YamuxTest do
     assert {:stream_data, sid, "hello"} in events_b2
   end
 end
-

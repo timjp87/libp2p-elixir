@@ -31,4 +31,3 @@ defmodule Libp2p.MultistreamSelectTest do
     assert init.selected == "/noise"
   end
 end
-

@@ -105,4 +105,3 @@ defmodule Libp2p.Yamux.Frame do
     end
   end
 end
-

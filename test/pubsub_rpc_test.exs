@@ -23,4 +23,3 @@ defmodule Libp2p.PubsubRpcTest do
     assert_raise ArgumentError, fn -> Pubsub.validate_strict_no_sign!(msg) end
   end
 end
-

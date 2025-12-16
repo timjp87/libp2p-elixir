@@ -32,4 +32,3 @@ defmodule Libp2p.ReqRespServerTest do
     assert {:ok, "resp"} == Task.await(t1, 5_000)
   end
 end
-

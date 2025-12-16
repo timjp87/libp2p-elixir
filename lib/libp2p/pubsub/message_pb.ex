@@ -86,4 +86,3 @@ defmodule Libp2p.Pubsub.MessagePB do
     end
   end
 end
-

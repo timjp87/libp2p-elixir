@@ -15,6 +15,8 @@ defmodule Libp2p.Noise do
   @protocol_name "Noise_XX_25519_ChaChaPoly_SHA256"
   @sig_prefix "noise-libp2p-static-key:"
   @tag_len 16
+  @u64_max 0xFFFF_FFFF_FFFF_FFFF
+  @agent_log_path "/Users/timjester-pfadt/dev/ethereum/panacea/.cursor/debug.log"
 
   @type role :: :initiator | :responder
 
@@ -26,6 +28,8 @@ defmodule Libp2p.Noise do
           ck: binary(),
           h: binary(),
           cs: cipher_state(),
+          hkdf_swap?: boolean(),
+          nonce_be?: boolean(),
           # DH keys (25519)
           s_priv: binary(),
           s_pub: binary(),
@@ -35,19 +39,50 @@ defmodule Libp2p.Noise do
           rs: binary() | nil,
           # libp2p identity for signing/verification
           identity: Identity.t() | nil,
-          remote_identity_key: {atom(), binary()} | nil
+          remote_identity_key: {atom(), binary()} | nil,
+          # NoiseExtensions: stream muxer negotiation (optional).
+          local_stream_muxers: [binary()],
+          remote_stream_muxers: [binary()],
+          selected_stream_muxer: binary() | nil
         }
 
   @spec new(role(), Identity.t()) :: state()
-  def new(role, %Identity{} = identity) when role in [:initiator, :responder] do
-    {s_pub, s_priv} = :crypto.generate_key(:ecdh, :x25519)
-    {ck, h} = initialize_symmetric()
+  # Interop default (snow / rust-libp2p): initialize `ck`/`h` with the (unpadded) protocol name.
+  # Note: our vendored libp2p Noise spec says to hash the protocol name, but the ecosystem
+  # (snow-based implementations) uses the generic Noise rule, and the protocol name is exactly
+  # 32 bytes, so there is no padding.
+  def new(role, %Identity{} = identity) when role in [:initiator, :responder], do: new(role, identity, <<>>, false, false, false)
 
-    %{
+  @spec new(role(), Identity.t(), binary()) :: state()
+  def new(role, %Identity{} = identity, prologue) when role in [:initiator, :responder] and is_binary(prologue),
+    do: new(role, identity, prologue, false, false, false)
+
+  @spec new(role(), Identity.t(), binary(), boolean()) :: state()
+  def new(role, %Identity{} = identity, prologue, hash_protocol_name?)
+      when role in [:initiator, :responder] and is_binary(prologue) and is_boolean(hash_protocol_name?) do
+    new(role, identity, prologue, hash_protocol_name?, false, false)
+  end
+
+  @spec new(role(), Identity.t(), binary(), boolean(), boolean()) :: state()
+  def new(role, %Identity{} = identity, prologue, hash_protocol_name?, hkdf_swap?)
+      when role in [:initiator, :responder] and is_binary(prologue) and is_boolean(hash_protocol_name?) and is_boolean(hkdf_swap?) do
+    new(role, identity, prologue, hash_protocol_name?, hkdf_swap?, false)
+  end
+
+  @spec new(role(), Identity.t(), binary(), boolean(), boolean(), boolean()) :: state()
+  def new(role, %Identity{} = identity, prologue, hash_protocol_name?, hkdf_swap?, nonce_be?)
+      when role in [:initiator, :responder] and is_binary(prologue) and is_boolean(hash_protocol_name?) and is_boolean(hkdf_swap?) and
+             is_boolean(nonce_be?) do
+    {s_pub, s_priv} = :crypto.generate_key(:ecdh, :x25519)
+    {ck, h} = initialize_symmetric(hash_protocol_name?)
+
+    st = %{
       role: role,
       ck: ck,
       h: h,
       cs: %{k: nil, n: 0},
+      hkdf_swap?: hkdf_swap?,
+      nonce_be?: nonce_be?,
       s_priv: s_priv,
       s_pub: s_pub,
       e_priv: nil,
@@ -55,8 +90,14 @@ defmodule Libp2p.Noise do
       re: nil,
       rs: nil,
       identity: identity,
-      remote_identity_key: nil
+      remote_identity_key: nil,
+      local_stream_muxers: ["/yamux/1.0.0"],
+      remote_stream_muxers: [],
+      selected_stream_muxer: nil
     }
+
+    # Snow mixes the prologue into `h` unconditionally (even if empty).
+    mix_hash(st, prologue)
   end
 
   # --- framing helpers (noise spec: 2-byte BE len prefix) ---
@@ -87,7 +128,71 @@ defmodule Libp2p.Noise do
     {e_pub, e_priv} = :crypto.generate_key(:ecdh, :x25519)
     st = %{st | e_pub: e_pub, e_priv: e_priv}
     st = mix_hash(st, e_pub)
+    # Snow always "encrypt_and_mix_hash(payload)" even if payload is empty.
+    # In XX, msg1 payload is empty, so this is equivalent to MixHash("").
+    st = mix_hash(st, <<>>)
     {e_pub, st}
+  end
+
+  @doc false
+  @spec __diag_try_decrypt_msg2_static__(state(), binary()) ::
+          [%{hash_protocol_name?: boolean(), hkdf_swap?: boolean(), nonce_be?: boolean(), rs_pub_prefix_hex: binary()}]
+  def __diag_try_decrypt_msg2_static__(%{role: :initiator, e_priv: e_priv, e_pub: e_pub, identity: %Identity{} = id}, msg2)
+      when is_binary(msg2) do
+    if not is_binary(e_priv) or not is_binary(e_pub) or byte_size(e_pub) != 32 do
+      []
+    else
+      prologues = [
+        <<>>,
+        "libp2p",
+        "libp2p-noise",
+        "/noise",
+        "/multistream/1.0.0",
+        @sig_prefix
+      ]
+
+      case msg2 do
+        <<re::binary-size(32), rest::binary>> when byte_size(rest) >= 48 ->
+          <<ct_s::binary-size(48), _::binary>> = rest
+
+          for prologue <- prologues,
+              hash_protocol_name? <- [false, true],
+              hkdf_swap? <- [false, true],
+              nonce_be? <- [false, true],
+              reduce: [] do
+            acc ->
+              st0 = new(:initiator, id, prologue, hash_protocol_name?, hkdf_swap?, nonce_be?)
+              # Replay initiator msg1 transcript with the *real* ephemeral keypair used on-wire.
+              st0 = %{st0 | e_priv: e_priv, e_pub: e_pub}
+              st0 = mix_hash(st0, e_pub)
+              st0 = %{st0 | re: re}
+              st0 = mix_hash(st0, re)
+              st0 = mix_key(st0, dh_x25519(e_priv, re))
+
+              try do
+                {rs_pub, _st1} = decrypt_with_ad(st0, st0.h, ct_s)
+
+                [
+                  %{
+                    prologue_len: byte_size(prologue),
+                    hash_protocol_name?: hash_protocol_name?,
+                    hkdf_swap?: hkdf_swap?,
+                    nonce_be?: nonce_be?,
+                    rs_pub_prefix_hex:
+                      Base.encode16(binary_part(rs_pub, 0, min(8, byte_size(rs_pub))), case: :lower)
+                  }
+                  | acc
+                ]
+              rescue
+                _ ->
+                  acc
+              end
+          end
+
+        _ ->
+          []
+      end
+    end
   end
 
   @doc """
@@ -99,6 +204,8 @@ defmodule Libp2p.Noise do
     # read initiator ephemeral
     st = %{st | re: msg1}
     st = mix_hash(st, msg1)
+    # Snow mixes in the (empty) payload of msg1.
+    st = mix_hash(st, <<>>)
 
     # generate responder ephemeral
     {e_pub, e_priv} = :crypto.generate_key(:ecdh, :x25519)
@@ -201,6 +308,7 @@ defmodule Libp2p.Noise do
   def transport_encrypt(%{k: key, n: n} = cs, plaintext, ad \\ <<>>)
       when is_binary(plaintext) and is_binary(ad) do
     if key == nil, do: raise(ArgumentError, "cipher state has no key")
+    if n > @u64_max, do: raise(ArgumentError, "nonce counter exhausted")
     nonce = <<0::unsigned-little-integer-size(32), n::unsigned-little-integer-size(64)>>
     {ciphertext, tag} = :crypto.crypto_one_time_aead(:chacha20_poly1305, key, nonce, plaintext, ad, true)
     {ciphertext <> tag, %{cs | n: n + 1}}
@@ -214,6 +322,7 @@ defmodule Libp2p.Noise do
       when is_binary(ciphertext_and_tag) and is_binary(ad) do
     if key == nil, do: raise(ArgumentError, "cipher state has no key")
     if byte_size(ciphertext_and_tag) < @tag_len, do: raise(ArgumentError, "truncated transport message")
+    if n > @u64_max, do: raise(ArgumentError, "nonce counter exhausted")
     nonce = <<0::unsigned-little-integer-size(32), n::unsigned-little-integer-size(64)>>
     ct_len = byte_size(ciphertext_and_tag) - @tag_len
     <<ct::binary-size(ct_len), tag::binary-size(@tag_len)>> = ciphertext_and_tag
@@ -225,13 +334,22 @@ defmodule Libp2p.Noise do
   end
 
   # --- symmetric state helpers (Noise Framework semantics) ---
-  defp initialize_symmetric do
-    # per Noise: if protocol name shorter than hashlen, pad with zeros; else hash.
+  defp initialize_symmetric(hash_protocol_name?) do
+    # NOTE: libp2p noise spec states the HandshakeState is initialized with the
+    # hash of the Noise protocol name (not the padded name per generic Noise).
+    #
+    # We keep the legacy padded behavior behind `hash_protocol_name? == false`
+    # for interoperability experiments.
     h0 =
-      if byte_size(@protocol_name) <= 32 do
-        @protocol_name <> :binary.copy(<<0>>, 32 - byte_size(@protocol_name))
-      else
+      if hash_protocol_name? do
         :crypto.hash(:sha256, @protocol_name)
+      else
+        # legacy (generic Noise): if protocol name shorter than hashlen, pad with zeros; else hash.
+        if byte_size(@protocol_name) <= 32 do
+          @protocol_name <> :binary.copy(<<0>>, 32 - byte_size(@protocol_name))
+        else
+          :crypto.hash(:sha256, @protocol_name)
+        end
       end
 
     {h0, h0}
@@ -242,7 +360,8 @@ defmodule Libp2p.Noise do
   end
 
   defp mix_key(st, ikm) do
-    {ck, k} = hkdf2(st.ck, ikm)
+    {t1, t2} = hkdf2(st.ck, ikm)
+    {ck, k} = if(st.hkdf_swap?, do: {t2, t1}, else: {t1, t2})
     %{st | ck: ck, cs: %{k: k, n: 0}}
   end
 
@@ -270,7 +389,62 @@ defmodule Libp2p.Noise do
     need = n + @tag_len
     if byte_size(bin) < need, do: raise(ArgumentError, "truncated ciphertext")
     <<ct::binary-size(need), rest::binary>> = bin
-    {pt, st2} = decrypt_with_ad(st, st.h, ct)
+    # region agent log
+    agent_log(
+      "P",
+      "third_party/libp2p_elixir/lib/libp2p/noise.ex:decrypt_and_hash_exact/3",
+      "handshake decrypt attempt",
+      %{
+        n: n,
+        ct_bytes: byte_size(ct),
+        cs_n: st.cs.n,
+        hkdf_swap: st.hkdf_swap?,
+        nonce_be: Map.get(st, :nonce_be?, false),
+        h8:
+          Base.encode16(binary_part(st.h, 0, min(8, byte_size(st.h))), case: :lower),
+        ck8:
+          Base.encode16(binary_part(st.ck, 0, min(8, byte_size(st.ck))), case: :lower),
+        k8:
+          if(is_binary(st.cs.k),
+            do: Base.encode16(binary_part(st.cs.k, 0, min(8, byte_size(st.cs.k))), case: :lower),
+            else: ""
+          )
+      }
+    )
+    # endregion agent log
+
+    {pt, st2} =
+      try do
+        decrypt_with_ad(st, st.h, ct)
+      rescue
+        e in ArgumentError ->
+          # region agent log
+          agent_log(
+            "P",
+            "third_party/libp2p_elixir/lib/libp2p/noise.ex:decrypt_and_hash_exact/3",
+            "handshake decrypt failed",
+            %{
+              n: n,
+              ct_bytes: byte_size(ct),
+              cs_n: st.cs.n,
+              hkdf_swap: st.hkdf_swap?,
+              nonce_be: Map.get(st, :nonce_be?, false),
+              h8:
+                Base.encode16(binary_part(st.h, 0, min(8, byte_size(st.h))), case: :lower),
+              ck8:
+                Base.encode16(binary_part(st.ck, 0, min(8, byte_size(st.ck))), case: :lower),
+              k8:
+                if(is_binary(st.cs.k),
+                  do: Base.encode16(binary_part(st.cs.k, 0, min(8, byte_size(st.cs.k))), case: :lower),
+                  else: ""
+                ),
+              error: Exception.message(e)
+            }
+          )
+          # endregion agent log
+
+          reraise e, __STACKTRACE__
+      end
     if byte_size(pt) != n, do: raise(ArgumentError, "unexpected plaintext length")
     st2 = mix_hash(st2, ct)
     {pt, rest, st2}
@@ -288,6 +462,52 @@ defmodule Libp2p.Noise do
     {pt, <<>>, st2}
   end
 
+  defp agent_log(hypothesis_id, location, message, data) when is_map(data) do
+    payload =
+      %{
+        sessionId: "debug-session",
+        runId: "pre-fix",
+        hypothesisId: hypothesis_id,
+        location: location,
+        message: message,
+        data: data,
+        timestamp: System.system_time(:millisecond)
+      }
+      |> agent_json()
+
+    File.write!(@agent_log_path, payload <> "\n", [:append])
+  rescue
+    _ -> :ok
+  end
+
+  defp agent_json(map) when is_map(map) do
+    "{" <>
+      (map
+       |> Enum.map(fn {k, v} -> agent_json_string(to_string(k)) <> ":" <> agent_json(v) end)
+       |> Enum.join(",")) <> "}"
+  end
+
+  defp agent_json(list) when is_list(list) do
+    "[" <> (list |> Enum.map(&agent_json/1) |> Enum.join(",")) <> "]"
+  end
+
+  defp agent_json(bin) when is_binary(bin), do: agent_json_string(bin)
+  defp agent_json(i) when is_integer(i), do: Integer.to_string(i)
+  defp agent_json(true), do: "true"
+  defp agent_json(false), do: "false"
+  defp agent_json(nil), do: "null"
+  defp agent_json(other), do: agent_json_string(inspect(other, limit: 50))
+
+  defp agent_json_string(s) when is_binary(s) do
+    "\"" <>
+      (s
+       |> String.replace("\\", "\\\\")
+       |> String.replace("\"", "\\\"")
+       |> String.replace("\n", "\\n")
+       |> String.replace("\r", "\\r")
+       |> String.replace("\t", "\\t")) <> "\""
+  end
+
   defp split(st) do
     {k1, k2} = hkdf2(st.ck, <<>>)
     {%{k: k1, n: 0}, %{k: k2, n: 0}}
@@ -301,17 +521,59 @@ defmodule Libp2p.Noise do
     {t1, t2}
   end
 
+  # --- internal helpers for tests ---
+  @doc false
+  @spec __hkdf2__(binary(), binary()) :: {binary(), binary()}
+  def __hkdf2__(chaining_key, ikm) when is_binary(chaining_key) and is_binary(ikm), do: hkdf2(chaining_key, ikm)
+
+  @doc false
+  @spec __nonce12__(non_neg_integer(), :little | :big) :: <<_::96>>
+  def __nonce12__(n, endian) when is_integer(n) and n >= 0 and endian in [:little, :big] do
+    case endian do
+      :little -> <<0::unsigned-little-integer-size(32), n::unsigned-little-integer-size(64)>>
+      :big -> <<0::unsigned-big-integer-size(32), n::unsigned-big-integer-size(64)>>
+    end
+  end
+
+  @doc false
+  @spec __initiator_with_ephemeral__(Identity.t(), binary(), boolean(), boolean(), boolean(), binary(), binary()) :: state()
+  def __initiator_with_ephemeral__(%Identity{} = identity, prologue, hash_protocol_name?, hkdf_swap?, nonce_be?, e_pub, e_priv)
+      when is_binary(prologue) and is_boolean(hash_protocol_name?) and is_boolean(hkdf_swap?) and is_boolean(nonce_be?) and
+             is_binary(e_pub) and is_binary(e_priv) and byte_size(e_pub) == 32 and byte_size(e_priv) == 32 do
+    st = new(:initiator, identity, prologue, hash_protocol_name?, hkdf_swap?, nonce_be?)
+    st = %{st | e_pub: e_pub, e_priv: e_priv}
+    st = mix_hash(st, e_pub)
+    mix_hash(st, <<>>)
+  end
+
   # --- AEAD ChaCha20-Poly1305 (handshake encrypt/decrypt) ---
   defp encrypt_with_ad(%{cs: %{k: key, n: n}} = st, ad, plaintext) do
-    nonce = <<0::unsigned-little-integer-size(32), n::unsigned-little-integer-size(64)>>
+    if n > @u64_max, do: raise(ArgumentError, "nonce counter exhausted")
+    if not is_binary(key) or byte_size(key) != 32, do: raise(ArgumentError, "bad chacha20 key length: #{inspect(byte_size(key))}")
+    nonce =
+      if st.nonce_be? do
+        <<0::unsigned-big-integer-size(32), n::unsigned-big-integer-size(64)>>
+      else
+        <<0::unsigned-little-integer-size(32), n::unsigned-little-integer-size(64)>>
+      end
+    if byte_size(nonce) != 12, do: raise(ArgumentError, "bad chacha20 nonce length: #{inspect(byte_size(nonce))}")
     {ciphertext, tag} = :crypto.crypto_one_time_aead(:chacha20_poly1305, key, nonce, plaintext, ad, true)
     {ciphertext <> tag, %{st | cs: %{st.cs | n: n + 1}}}
   end
 
   defp decrypt_with_ad(%{cs: %{k: key, n: n}} = st, ad, ciphertext_and_tag) do
-    nonce = <<0::unsigned-little-integer-size(32), n::unsigned-little-integer-size(64)>>
+    if n > @u64_max, do: raise(ArgumentError, "nonce counter exhausted")
+    if not is_binary(key) or byte_size(key) != 32, do: raise(ArgumentError, "bad chacha20 key length: #{inspect(byte_size(key))}")
+    nonce =
+      if st.nonce_be? do
+        <<0::unsigned-big-integer-size(32), n::unsigned-big-integer-size(64)>>
+      else
+        <<0::unsigned-little-integer-size(32), n::unsigned-little-integer-size(64)>>
+      end
+    if byte_size(nonce) != 12, do: raise(ArgumentError, "bad chacha20 nonce length: #{inspect(byte_size(nonce))}")
     ct_len = byte_size(ciphertext_and_tag) - @tag_len
     <<ct::binary-size(ct_len), tag::binary-size(@tag_len)>> = ciphertext_and_tag
+    if byte_size(tag) != @tag_len, do: raise(ArgumentError, "bad chacha20 tag length: #{inspect(byte_size(tag))}")
 
     case :crypto.crypto_one_time_aead(:chacha20_poly1305, key, nonce, ct, ad, tag, false) do
       :error -> raise(ArgumentError, "AEAD decrypt failed")
@@ -328,12 +590,25 @@ defmodule Libp2p.Noise do
   defp make_handshake_payload(%Identity{} = identity, noise_static_pub32) when is_binary(noise_static_pub32) do
     identity_key_pb = PublicKeyPB.encode_public_key(:secp256k1, identity.pubkey_compressed)
     sig = Secp256k1.sign_bitcoin(identity.privkey, @sig_prefix <> noise_static_pub32)
-    HandshakePayloadPB.encode(%{identity_key: identity_key_pb, identity_sig: sig})
+    # Advertise supported stream muxers (NoiseExtensions.stream_muxers) per spec.
+    ext = HandshakePayloadPB.encode_extensions(%{stream_muxers: ["/yamux/1.0.0"]})
+    HandshakePayloadPB.encode(%{identity_key: identity_key_pb, identity_sig: sig, extensions: ext})
   end
 
   defp verify_handshake_payload!(st, payload_bin, noise_static_pub32) do
+    {type, key_bytes, remote_muxers} = verify_handshake_payload(payload_bin, noise_static_pub32)
+    st = %{st | remote_identity_key: {type, key_bytes}, remote_stream_muxers: remote_muxers}
+    select_stream_muxer(st)
+  end
+
+  defp verify_handshake_payload(payload_bin, noise_static_pub32) do
     payload = HandshakePayloadPB.decode(payload_bin)
     {type, key_bytes} = PublicKeyPB.decode_public_key(payload.identity_key)
+    remote_muxers =
+      case HandshakePayloadPB.decode_extensions(payload.extensions) do
+        %{stream_muxers: muxers} when is_list(muxers) -> muxers
+        _ -> []
+      end
 
     ok =
       case type do
@@ -346,6 +621,48 @@ defmodule Libp2p.Noise do
       end
 
     if not ok, do: raise(ArgumentError, "invalid noise-libp2p static key signature")
-    %{st | remote_identity_key: {type, key_bytes}}
+    {type, key_bytes, remote_muxers}
+  end
+
+  @doc false
+  @spec __verify_handshake_payload__(binary(), binary()) :: {atom(), binary()}
+  def __verify_handshake_payload__(payload_bin, noise_static_pub32)
+      when is_binary(payload_bin) and is_binary(noise_static_pub32) and byte_size(noise_static_pub32) == 32 do
+    verify_handshake_payload(payload_bin, noise_static_pub32)
+  end
+
+  defp select_stream_muxer(%{selected_stream_muxer: sel} = st) when is_binary(sel), do: st
+
+  defp select_stream_muxer(%{role: :initiator} = st) do
+    # Initiator ordering determines selection.
+    sel = Enum.find(st.local_stream_muxers, fn m -> is_binary(m) and m in st.remote_stream_muxers end)
+
+    cond do
+      st.remote_stream_muxers == [] ->
+        # Peer did not advertise muxers via NoiseExtensions; fall back to MSS muxer negotiation.
+        st
+
+      is_binary(sel) ->
+        %{st | selected_stream_muxer: sel}
+
+      true ->
+        raise(ArgumentError, "no common stream muxer in noise extensions")
+    end
+  end
+
+  defp select_stream_muxer(%{role: :responder} = st) do
+    # Responder must respect initiator ordering (which we receive as `remote_stream_muxers`).
+    sel = Enum.find(st.remote_stream_muxers, fn m -> is_binary(m) and m in st.local_stream_muxers end)
+
+    cond do
+      st.remote_stream_muxers == [] ->
+        st
+
+      is_binary(sel) ->
+        %{st | selected_stream_muxer: sel}
+
+      true ->
+        raise(ArgumentError, "no common stream muxer in noise extensions")
+    end
   end
 end

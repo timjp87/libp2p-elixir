@@ -27,13 +27,12 @@ defmodule Libp2p.Yamux.Session do
   @fin 0x4
   @rst 0x8
 
-  @initial_window 256 * 1024
-
   @type event ::
           {:stream_open, non_neg_integer()}
           | {:stream_data, non_neg_integer(), binary()}
           | {:stream_close, non_neg_integer()}
           | {:stream_reset, non_neg_integer()}
+          | {:go_away, non_neg_integer()}
 
   @spec new(:client | :server) :: t()
   def new(role) when role in [:client, :server] do
@@ -55,6 +54,20 @@ defmodule Libp2p.Yamux.Session do
   end
 
   @doc """
+  Open an outbound stream and send initial data in the SYN frame.
+
+  Some peers appear to be strict about receiving the first payload alongside SYN.
+  Returns `{stream_id, out_bytes, session2}`.
+  """
+  @spec open_stream_with_data(t(), binary()) :: {non_neg_integer(), binary(), t()}
+  def open_stream_with_data(%__MODULE__{} = st, data) when is_binary(data) do
+    id = st.next_stream_id
+    st = %{st | next_stream_id: id + 2, streams: Map.put(st.streams, id, stream_state(:outbound))}
+    frame = %Frame{type: :data, flags: @syn, stream_id: id, data: data}
+    {id, Frame.encode(frame) |> IO.iodata_to_binary(), st}
+  end
+
+  @doc """
   Send data on an open stream. Returns `{out_bytes, st2}`.
   """
   @spec send_data(t(), non_neg_integer(), binary()) :: {binary(), t()}
@@ -69,10 +82,15 @@ defmodule Libp2p.Yamux.Session do
   """
   @spec close_stream(t(), non_neg_integer()) :: {binary(), t()}
   def close_stream(%__MODULE__{} = st, stream_id) when is_integer(stream_id) do
-    s = Map.fetch!(st.streams, stream_id)
-    st = %{st | streams: Map.put(st.streams, stream_id, Map.put(s, :local_closed, true))}
-    frame = %Frame{type: :data, flags: @fin, stream_id: stream_id, data: <<>>}
-    {Frame.encode(frame) |> IO.iodata_to_binary(), maybe_gc(stream_id, st)}
+    case Map.get(st.streams, stream_id) do
+      nil ->
+        {<<>>, st}
+
+      s ->
+        st = %{st | streams: Map.put(st.streams, stream_id, Map.put(s, :local_closed, true))}
+        frame = %Frame{type: :data, flags: @fin, stream_id: stream_id, data: <<>>}
+        {Frame.encode(frame) |> IO.iodata_to_binary(), maybe_gc(stream_id, st)}
+    end
   end
 
   @doc """
@@ -116,8 +134,12 @@ defmodule Libp2p.Yamux.Session do
       Map.has_key?(st.streams, id) == false and band(flags, @syn) != 0 ->
         # new inbound stream
         st = %{st | streams: Map.put(st.streams, id, stream_state(:inbound))}
-        # ACK it (can be Data or WindowUpdate; we use WindowUpdate with ACK and initial window)
-        ack = %Frame{type: :window_update, flags: @ack, stream_id: id, length: @initial_window}
+        # ACK it.
+        #
+        # The yamux spec allows replying with either a DATA or WINDOW_UPDATE frame carrying ACK.
+        # In practice, some implementations appear to be stricter about the ACK frame type.
+        # Use an empty DATA+ACK here for broad interop.
+        ack = %Frame{type: :data, flags: @ack, stream_id: id, data: <<>>}
         events = [{:stream_open, id} | events]
         events = if f.data != <<>>, do: [{:stream_data, id, f.data} | events], else: events
         {events, [Frame.encode(ack) | out], st}
@@ -125,12 +147,17 @@ defmodule Libp2p.Yamux.Session do
       band(flags, @ack) != 0 ->
         s = Map.get(st.streams, id, %{})
         st = %{st | streams: Map.put(st.streams, id, Map.put(s, :acked, true))}
-        {events, out, st}
+        # ACK may be combined with a DATA frame (including payload and/or FIN).
+        events = if f.data != <<>>, do: [{:stream_data, id, f.data} | events], else: events
+        st2 = maybe_handle_fin(st, id, flags)
+        events = if band(flags, @fin) != 0, do: [{:stream_close, id} | events], else: events
+        {events, out, st2}
 
       true ->
         events = if f.data != <<>>, do: [{:stream_data, id, f.data} | events], else: events
-
-        {events, out, maybe_handle_fin(st, id, flags)}
+        st2 = maybe_handle_fin(st, id, flags)
+        events = if band(flags, @fin) != 0, do: [{:stream_close, id} | events], else: events
+        {events, out, st2}
     end
   end
 
@@ -138,11 +165,15 @@ defmodule Libp2p.Yamux.Session do
     id = f.stream_id
     flags = f.flags || 0
 
-    st =
+    {events, out, st} =
       if Map.has_key?(st.streams, id) == false and band(flags, @syn) != 0 do
-        %{st | streams: Map.put(st.streams, id, stream_state(:inbound))}
+        st = %{st | streams: Map.put(st.streams, id, stream_state(:inbound))}
+        # See comment above: ACK only, no window delta.
+        ack = %Frame{type: :window_update, flags: @ack, stream_id: id, length: 0}
+        events = [{:stream_open, id} | events]
+        {events, [Frame.encode(ack) | out], st}
       else
-        st
+        {events, out, st}
       end
 
     if band(flags, @ack) != 0 do
@@ -154,8 +185,21 @@ defmodule Libp2p.Yamux.Session do
     end
   end
 
-  defp handle_frame(st, %Frame{type: :ping}, events, out), do: {events, out, st}
-  defp handle_frame(st, %Frame{type: :go_away}, events, out), do: {events, out, st}
+  defp handle_frame(st, %Frame{type: :ping} = f, events, out) do
+    # Yamux ping: reply to SYN with ACK and same "length" (nonce).
+    flags = f.flags || 0
+
+    if band(flags, @syn) != 0 and band(flags, @ack) == 0 do
+      ack = %Frame{type: :ping, flags: @ack, stream_id: 0, length: f.length}
+      {events, [Frame.encode(ack) | out], st}
+    else
+      {events, out, st}
+    end
+  end
+  defp handle_frame(st, %Frame{type: :go_away} = f, events, out) do
+    # Surface GOAWAY for diagnostics; callers may choose to close the connection.
+    {[{:go_away, f.length} | events], out, st}
+  end
 
   defp maybe_handle_fin(st, id, flags) do
     if band(flags, @fin) != 0 do

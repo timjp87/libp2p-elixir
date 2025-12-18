@@ -145,15 +145,6 @@ defmodule Libp2p.Gossipsub do
   end
 
   @impl true
-  def handle_cast({:peer_connected, peer_id, conn}, st) do
-    st = put_peer(st, peer_id, %{conn: conn, inbound_stream_id: nil, outbound_stream_id: nil, topics: MapSet.new(), buf: <<>>})
-    # Establish outbound gossipsub stream (unidirectional writer).
-    server = self()
-    Task.start(fn -> ensure_outbound_stream(server, peer_id, conn) end)
-    {:noreply, st}
-  end
-
-  @impl true
   def handle_call({:inbound_stream, peer_id, conn, stream_id, initial}, _from, st) do
     st = ensure_peer(st, peer_id, conn)
     st = put_peer_field(st, peer_id, :inbound_stream_id, stream_id)
@@ -163,9 +154,14 @@ defmodule Libp2p.Gossipsub do
     {:reply, {:ok, pid}, st}
   end
 
-  # Keep old cast for backward compat if needed, or remove?
-  # Removing to ensure safety.
-  # def handle_cast({:inbound_stream, ...}, st) ... deleted
+  @impl true
+  def handle_cast({:peer_connected, peer_id, conn}, st) do
+    st = put_peer(st, peer_id, %{conn: conn, inbound_stream_id: nil, outbound_stream_id: nil, topics: MapSet.new(), buf: <<>>})
+    # Establish outbound gossipsub stream (unidirectional writer).
+    server = self()
+    Task.start(fn -> ensure_outbound_stream(server, peer_id, conn) end)
+    {:noreply, st}
+  end
 
   def handle_cast({:subscribe, topic}, st) do
     if MapSet.member?(st.subscriptions, topic) do
@@ -223,6 +219,8 @@ defmodule Libp2p.Gossipsub do
 
     {:noreply, st}
   end
+
+
 
   @impl true
   def handle_info({:outbound_ready, peer_id, stream_id}, st) do

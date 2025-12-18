@@ -23,7 +23,8 @@ defmodule Libp2p.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      # kept intentionally minimal; avoid pulling in full protobuf stacks
+      # Documentation
+      {:ex_doc, ">= 0.0.0", only: :dev, runtime: false}
     ]
   end
 

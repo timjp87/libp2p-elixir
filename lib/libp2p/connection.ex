@@ -291,22 +291,7 @@ defmodule Libp2p.Connection do
 
 # ...
 
-  def handle_call({:set_stream_handler, id, pid}, _from, st) do
-    st = ensure_stream(st, id)
-    s = st.streams[id]
 
-    # If buffer has data, push it immediately
-    s =
-      if s.buf != <<>> do
-        send(pid, {:libp2p, :stream_data, self(), id, s.buf})
-        %{s | buf: <<>>}
-      else
-        s
-      end
-
-    put_stream(st, id, %{s | owner: pid})
-    {:reply, :ok, st}
-  end
 
 # ...
 

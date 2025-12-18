@@ -233,10 +233,7 @@ defmodule Libp2p.ConnectionV2 do
 
 # ...
 
-  defp notify_waiters(st) do
-    Enum.each(st.ready_waiters, fn from -> GenServer.reply(from, :ok) end)
-    %{st | ready_waiters: []}
-  end
+
 
 # ... (in finish_noise and handle_transport_plaintext)
 

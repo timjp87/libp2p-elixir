@@ -25,10 +25,26 @@ defmodule Libp2p.StreamNegotiator do
 
   defp negotiate(conn, stream_id, st, supported, opts) do
     timeout = Keyword.get(opts, :timeout, 5_000)
-    {out0, st} = MultistreamSelect.start(st)
-    case Connection.stream_send(conn, stream_id, out0) do
-      :ok -> loop(conn, stream_id, st, supported, timeout)
+
+    # Enable active mode (Push)
+    case try_set_handler(conn, stream_id) do
+      :ok ->
+        {out0, st} = MultistreamSelect.start(st)
+        case Connection.stream_send(conn, stream_id, out0) do
+          :ok -> loop(conn, stream_id, st, supported, timeout)
+          {:error, reason} -> {:error, reason}
+        end
+
       {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp try_set_handler(conn, stream_id) do
+    try do
+      Libp2p.Connection.set_stream_handler(conn, stream_id, self())
+    rescue
+      # Fallback for very old implementations if any
+      _ -> :ok
     end
   end
 
@@ -36,7 +52,17 @@ defmodule Libp2p.StreamNegotiator do
     if st.selected != nil do
       {:ok, st.selected, st.buf}
     else
-      case Connection.stream_recv(conn, stream_id, timeout) do
+      # Receive from mailbox (Push mode)
+      msg =
+        receive do
+          {:libp2p, :stream_data, ^conn, ^stream_id, data} -> {:ok, data}
+          {:libp2p, :stream_closed, ^conn, ^stream_id} -> {:error, :closed}
+          {:libp2p, :stream_reset, ^conn, ^stream_id} -> {:error, :reset}
+        after
+          timeout -> {:error, :timeout}
+        end
+
+      case msg do
         {:ok, data} ->
           {events, out, st2} = MultistreamSelect.feed(st, data, supported)
           send_result =

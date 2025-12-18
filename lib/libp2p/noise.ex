@@ -1,11 +1,37 @@
 defmodule Libp2p.Noise do
   @moduledoc """
-  noise-libp2p secure channel (Noise_XX_25519_ChaChaPoly_SHA256).
+  Implements the Noise secure channel handshake for Libp2p.
 
-  This implements the handshake logic defined in `third_party/libp2p_specs/noise/README.md`.
-  It is not yet wired to sockets; it operates on binary messages:
-  - during handshake: the `noise_message` field (excluding the 2-byte length prefix)
-  - after handshake: transport messages are AEAD ciphertext (excluding length prefix)
+  This module handles the cryptographic handshake that upgrades a raw connection to an
+  encrypted, authenticated session. It specifically implements the
+  `Noise_XX_25519_ChaChaPoly_SHA256` protocol.
+
+  ## Protocol Details
+
+  - **Pattern**: `XX` (Mutual authentication, 3 messages).
+  - **DH Curve**: `25519` (X25519).
+  - **Cipher**: `ChaChaPoly` (ChaCha20-Poly1305).
+  - **Hash**: `SHA256`.
+
+  ## Handshake Flow (XX Pattern)
+
+  The handshake consists of three messages exchanged between the Initiator (I) and Responder (R):
+
+  1.  `I -> R`: `e` (Initiator sends ephemeral public key).
+  2.  `R -> I`: `e, ee, s, es` (Responder sends ephemeral key, performs DH, sends encrypted static key and payload).
+  3.  `I -> R`: `s, se` (Initiator sends encrypted static key and payload).
+
+  After this exchange, both parties share two `CipherState` objects for encrypting traffic in each direction.
+
+  ## Authentication
+
+  Libp2p distinguishes between the "Noise Static Key" (used for the session) and the persistent
+  "Identity Key" (e.g., the peer's Ed25519 key). To bind these together, the handshake payload
+  includes:
+  - The Identity Public Key.
+  - A signature of the Noise Static Key, signed by the Identity Private Key.
+
+  This ensures that the peer controlling the Noise session also controls the claimed Libp2p Identity.
   """
 
   alias Libp2p.Identity
@@ -16,7 +42,7 @@ defmodule Libp2p.Noise do
   @sig_prefix "noise-libp2p-static-key:"
   @tag_len 16
   @u64_max 0xFFFF_FFFF_FFFF_FFFF
-  @agent_log_path "/Users/timjester-pfadt/dev/ethereum/panacea/.cursor/debug.log"
+
 
   @type role :: :initiator | :responder
 
@@ -389,59 +415,14 @@ defmodule Libp2p.Noise do
     need = n + @tag_len
     if byte_size(bin) < need, do: raise(ArgumentError, "truncated ciphertext")
     <<ct::binary-size(need), rest::binary>> = bin
-    # region agent log
-    agent_log(
-      "P",
-      "third_party/libp2p_elixir/lib/libp2p/noise.ex:decrypt_and_hash_exact/3",
-      "handshake decrypt attempt",
-      %{
-        n: n,
-        ct_bytes: byte_size(ct),
-        cs_n: st.cs.n,
-        hkdf_swap: st.hkdf_swap?,
-        nonce_be: Map.get(st, :nonce_be?, false),
-        h8:
-          Base.encode16(binary_part(st.h, 0, min(8, byte_size(st.h))), case: :lower),
-        ck8:
-          Base.encode16(binary_part(st.ck, 0, min(8, byte_size(st.ck))), case: :lower),
-        k8:
-          if(is_binary(st.cs.k),
-            do: Base.encode16(binary_part(st.cs.k, 0, min(8, byte_size(st.cs.k))), case: :lower),
-            else: ""
-          )
-      }
-    )
-    # endregion agent log
+
 
     {pt, st2} =
       try do
         decrypt_with_ad(st, st.h, ct)
       rescue
         e in ArgumentError ->
-          # region agent log
-          agent_log(
-            "P",
-            "third_party/libp2p_elixir/lib/libp2p/noise.ex:decrypt_and_hash_exact/3",
-            "handshake decrypt failed",
-            %{
-              n: n,
-              ct_bytes: byte_size(ct),
-              cs_n: st.cs.n,
-              hkdf_swap: st.hkdf_swap?,
-              nonce_be: Map.get(st, :nonce_be?, false),
-              h8:
-                Base.encode16(binary_part(st.h, 0, min(8, byte_size(st.h))), case: :lower),
-              ck8:
-                Base.encode16(binary_part(st.ck, 0, min(8, byte_size(st.ck))), case: :lower),
-              k8:
-                if(is_binary(st.cs.k),
-                  do: Base.encode16(binary_part(st.cs.k, 0, min(8, byte_size(st.cs.k))), case: :lower),
-                  else: ""
-                ),
-              error: Exception.message(e)
-            }
-          )
-          # endregion agent log
+
 
           reraise e, __STACKTRACE__
       end
@@ -462,51 +443,7 @@ defmodule Libp2p.Noise do
     {pt, <<>>, st2}
   end
 
-  defp agent_log(hypothesis_id, location, message, data) when is_map(data) do
-    payload =
-      %{
-        sessionId: "debug-session",
-        runId: "pre-fix",
-        hypothesisId: hypothesis_id,
-        location: location,
-        message: message,
-        data: data,
-        timestamp: System.system_time(:millisecond)
-      }
-      |> agent_json()
 
-    File.write!(@agent_log_path, payload <> "\n", [:append])
-  rescue
-    _ -> :ok
-  end
-
-  defp agent_json(map) when is_map(map) do
-    "{" <>
-      (map
-       |> Enum.map(fn {k, v} -> agent_json_string(to_string(k)) <> ":" <> agent_json(v) end)
-       |> Enum.join(",")) <> "}"
-  end
-
-  defp agent_json(list) when is_list(list) do
-    "[" <> (list |> Enum.map(&agent_json/1) |> Enum.join(",")) <> "]"
-  end
-
-  defp agent_json(bin) when is_binary(bin), do: agent_json_string(bin)
-  defp agent_json(i) when is_integer(i), do: Integer.to_string(i)
-  defp agent_json(true), do: "true"
-  defp agent_json(false), do: "false"
-  defp agent_json(nil), do: "null"
-  defp agent_json(other), do: agent_json_string(inspect(other, limit: 50))
-
-  defp agent_json_string(s) when is_binary(s) do
-    "\"" <>
-      (s
-       |> String.replace("\\", "\\\\")
-       |> String.replace("\"", "\\\"")
-       |> String.replace("\n", "\\n")
-       |> String.replace("\r", "\\r")
-       |> String.replace("\t", "\\t")) <> "\""
-  end
 
   defp split(st) do
     {k1, k2} = hkdf2(st.ck, <<>>)

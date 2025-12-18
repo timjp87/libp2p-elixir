@@ -1,8 +1,10 @@
 defmodule Libp2p.Supervisor do
   @moduledoc """
-  Top-level supervisor for the libp2p runtime.
+  Top-level supervisor for the Libp2p application.
 
-  This is intentionally minimal and is expected to be started by Panacea.
+  This supervisor starts the core components of the stack:
+  - `Libp2p.Swarm`: Manages connections and listeners.
+  - `Libp2p.PeerStore`: Manages peer metadata (keys, addresses).
   """
 
   use Supervisor

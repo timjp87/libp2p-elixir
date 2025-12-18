@@ -4,9 +4,11 @@ defmodule Libp2p.MixProject do
   def project do
     [
       app: :libp2p_elixir,
-      version: "0.1.0",
+      version: "0.9.0",
       elixir: "~> 1.19",
       start_permanent: Mix.env() == :prod,
+      description: description(),
+      package: package(),
       deps: deps()
     ]
   end
@@ -22,6 +24,17 @@ defmodule Libp2p.MixProject do
   defp deps do
     [
       # kept intentionally minimal; avoid pulling in full protobuf stacks
+    ]
+  end
+
+  defp description do
+    "A standalone Elixir implementation of the Libp2p networking stack"
+  end
+
+  defp package do
+    [
+      licenses: ["MIT"],
+      links: %{"GitHub" => "https://github.com/timjp87/libp2p-elixir"}
     ]
   end
 end

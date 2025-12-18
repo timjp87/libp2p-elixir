@@ -27,7 +27,7 @@ defmodule Libp2p.NoisePayloadSignatureTest do
 
     pb = payload_bin(identity_key_pb, sig)
 
-    assert {:secp256k1, pub33} = Noise.__verify_handshake_payload__(pb, noise_pub32)
+    assert {:secp256k1, pub33, _} = Noise.__verify_handshake_payload__(pb, noise_pub32)
     assert pub33 == id.pubkey_compressed
   end
 
@@ -71,10 +71,11 @@ defmodule Libp2p.NoisePayloadSignatureTest do
     identity_key_pb = PublicKeyPB.encode_public_key(:secp256k1, id.pubkey_compressed)
     sig = Secp256k1.sign_bitcoin(id.privkey, @sig_prefix <> noise_pub32)
 
-    ext = :crypto.strong_rand_bytes(33)
+    # Use valid encoded extensions (empty map) instead of random bytes
+    ext = Libp2p.Noise.HandshakePayloadPB.encode_extensions(%{stream_muxers: []})
     pb = payload_bin(identity_key_pb, sig, ext)
 
-    assert {:secp256k1, pub33} = Noise.__verify_handshake_payload__(pb, noise_pub32)
+    assert {:secp256k1, pub33, _} = Noise.__verify_handshake_payload__(pb, noise_pub32)
     assert pub33 == id.pubkey_compressed
   end
 end

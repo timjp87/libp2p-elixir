@@ -85,6 +85,12 @@ defmodule Libp2p.Connection do
     GenServer.call(conn, {:stream_close, stream_id})
   end
 
+  @doc "Set the process that will receive stream events."
+  @spec set_stream_handler(t(), non_neg_integer(), pid()) :: :ok
+  def set_stream_handler(conn, stream_id, pid) do
+    GenServer.call(conn, {:set_stream_handler, stream_id, pid})
+  end
+
   @impl true
   def init(opts) do
     st = %{
@@ -161,6 +167,20 @@ defmodule Libp2p.Connection do
     end
   end
 
+  def handle_call({:open_stream, initial_data}, _from, st) do
+    {id, out, yamux2} = Session.open_stream_with_data(st.yamux, initial_data)
+
+    case SecureConn.send(st.secure, out) do
+      {:ok, secure2} ->
+        st = %{st | secure: secure2, yamux: yamux2}
+        st = ensure_stream(st, id)
+        {:reply, {:ok, id}, st}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, st}
+    end
+  end
+
   def handle_call({:stream_send, id, data}, _from, st) do
     st = ensure_stream(st, id)
     {out, yamux2} = Session.send_data(st.yamux, id, data)
@@ -169,6 +189,10 @@ defmodule Libp2p.Connection do
       {:ok, secure2} -> {:reply, :ok, %{st | secure: secure2, yamux: yamux2}}
       {:error, reason} -> {:reply, {:error, reason}, st}
     end
+  end
+
+  def handle_call({:send_stream, id, data}, from, st) do
+    handle_call({:stream_send, id, data}, from, st)
   end
 
   def handle_call({:stream_close, id}, _from, st) do
@@ -185,6 +209,10 @@ defmodule Libp2p.Connection do
     end
   end
 
+  def handle_call({:close_stream, id}, from, st) do
+    handle_call({:stream_close, id}, from, st)
+  end
+
   def handle_call({:stream_recv, id}, from, st) do
     st = ensure_stream(st, id)
     s = st.streams[id]
@@ -199,6 +227,22 @@ defmodule Libp2p.Connection do
       true ->
         {:noreply, put_stream(st, id, %{s | waiters: [from | s.waiters]})}
     end
+  end
+
+  def handle_call({:set_stream_handler, id, pid}, _from, st) do
+    st = ensure_stream(st, id)
+    s = st.streams[id]
+
+    # If buffer has data, push it immediately
+    s =
+      if s.buf != <<>> do
+        send(pid, {:libp2p, :stream_data, self(), id, s.buf})
+        %{s | buf: <<>>}
+      else
+        s
+      end
+
+    {:reply, :ok, put_stream(st, id, %{s | owner: pid})}
   end
 
   @impl true
@@ -243,11 +287,34 @@ defmodule Libp2p.Connection do
 
   def handle_info(_msg, st), do: {:noreply, st}
 
+
+
+# ...
+
+  def handle_call({:set_stream_handler, id, pid}, _from, st) do
+    st = ensure_stream(st, id)
+    s = st.streams[id]
+
+    # If buffer has data, push it immediately
+    s =
+      if s.buf != <<>> do
+        send(pid, {:libp2p, :stream_data, self(), id, s.buf})
+        %{s | buf: <<>>}
+      else
+        s
+      end
+
+    put_stream(st, id, %{s | owner: pid})
+    {:reply, :ok, st}
+  end
+
+# ...
+
   defp ensure_stream(st, id) do
     if Map.has_key?(st.streams, id) do
       st
     else
-      put_stream(st, id, %{buf: <<>>, waiters: [], closed?: false})
+      put_stream(st, id, %{buf: <<>>, waiters: [], closed?: false, owner: nil})
     end
   end
 
@@ -256,7 +323,9 @@ defmodule Libp2p.Connection do
   end
 
   defp mark_stream_closed(st, id) do
-    s = Map.get(st.streams, id, %{buf: <<>>, waiters: [], closed?: true})
+    # Notify owner
+    s = Map.get(st.streams, id, %{buf: <<>>, waiters: [], closed?: true, owner: nil})
+    if is_pid(s.owner), do: send(s.owner, {:libp2p, :stream_closed, self(), id})
     put_stream(st, id, %{s | closed?: true})
   end
 
@@ -270,19 +339,27 @@ defmodule Libp2p.Connection do
       {:stream_data, id, data}, st_acc ->
         st_acc = ensure_stream(st_acc, id)
         s = st_acc.streams[id]
-        s = %{s | buf: s.buf <> data}
-        {st_acc, s} = maybe_wake_waiter(st_acc, id, s)
-        put_stream(st_acc, id, s)
+
+        if is_pid(s.owner) do
+             send(s.owner, {:libp2p, :stream_data, self(), id, data})
+             st_acc
+        else
+            s = %{s | buf: s.buf <> data}
+            {st_acc, s} = maybe_wake_waiter(st_acc, id, s)
+            put_stream(st_acc, id, s)
+        end
 
       {:stream_close, id}, st_acc ->
         st_acc = ensure_stream(st_acc, id)
         s = %{st_acc.streams[id] | closed?: true}
+        if is_pid(s.owner), do: send(s.owner, {:libp2p, :stream_closed, self(), id})
         {st_acc, s} = maybe_wake_waiter(st_acc, id, s)
         put_stream(st_acc, id, s)
 
       {:stream_reset, id}, st_acc ->
         st_acc = ensure_stream(st_acc, id)
         s = %{st_acc.streams[id] | closed?: true}
+        if is_pid(s.owner), do: send(s.owner, {:libp2p, :stream_closed, self(), id})
         {st_acc, s} = maybe_wake_waiter(st_acc, id, s)
         put_stream(st_acc, id, s)
     end)

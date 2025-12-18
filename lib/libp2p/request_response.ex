@@ -1,19 +1,11 @@
 defmodule Libp2p.RequestResponse do
   @moduledoc """
-  Minimal request-response protocol support (Eth2-oriented hooks).
-
-  Design:
-  - Swarm routes inbound streams based on the selected protocol id.
-  - This module dispatches to a registered handler per protocol id.
-  - Concurrency limiting is provided via `Libp2p.ReqRespServer`.
-
-  The byte-level framing and encoding is pluggable via a codec `{encode, decode}`.
-  By default, we use `Libp2p.RequestResponse.Framing` (uvarint length prefix).
+  Minimal request-response protocol support.
   """
 
   use GenServer
 
-  alias Libp2p.{Connection, ReqRespServer}
+  alias Libp2p.{ConnectionV2, ReqRespServer}
   alias Libp2p.RequestResponse.Framing
 
   @type proto_id :: binary()
@@ -35,25 +27,10 @@ defmodule Libp2p.RequestResponse do
 
   @doc """
   Register a handler for a protocol id.
-
-  Handler signature: `(peer_id, request_bytes) -> response_bytes`.
   """
   @spec register(pid() | atom(), proto_id(), (binary(), binary() -> binary())) :: :ok
   def register(rr, proto, fun) when is_binary(proto) and is_function(fun, 2) do
     GenServer.call(rr, {:register, proto, fun})
-  end
-
-  @doc """
-  Swarm stream router hook (requires Swarm to pass `proto` in).
-  """
-  @spec handle_inbound(pid(), non_neg_integer(), proto_id(), binary()) :: :ok
-  def handle_inbound(conn, stream_id, proto, initial) do
-    handle_inbound(__MODULE__, conn, stream_id, proto, initial)
-  end
-
-  @spec handle_inbound(pid() | atom(), pid(), non_neg_integer(), proto_id(), binary()) :: :ok
-  def handle_inbound(rr, conn, stream_id, proto, initial) do
-    GenServer.cast(rr, {:inbound, conn, stream_id, proto, initial || <<>>})
   end
 
   @doc """
@@ -66,87 +43,126 @@ defmodule Libp2p.RequestResponse do
     GenServer.call(rr, {:request, conn, proto, req_bytes, codec, timeout}, timeout + 1_000)
   end
 
+  @doc """
+  Handle an inbound stream for a registered protocol.
+  """
+  @spec handle_inbound(pid() | atom(), pid(), non_neg_integer(), proto_id(), binary()) :: :ok
+  def handle_inbound(rr, conn, stream_id, proto, initial) do
+    case GenServer.call(rr, {:get_handler, proto}) do
+      {:ok, handler, codec} ->
+        # We might need to handle negotiation if initial is empty?
+        # But handle_inbound is usually called *after* MSS selection.
+        # However, we need to handle the framing.
+
+        case recv_one(conn, stream_id, codec, 20_000, initial) do
+          {:ok, req_bytes} ->
+            {:ok, peer_id} = ConnectionV2.remote_peer_id(conn)
+            resp = handler.(peer_id, req_bytes)
+            encoded_resp = encode(codec, resp)
+            _ = ConnectionV2.send_stream(conn, stream_id, encoded_resp)
+            _ = ConnectionV2.close_stream(conn, stream_id)
+            :ok
+
+          {:error, _reason} ->
+            _ = ConnectionV2.reset_stream(conn, stream_id)
+            :ok
+        end
+
+      :error ->
+        _ = ConnectionV2.reset_stream(conn, stream_id)
+        :ok
+    end
+  end
+
   @impl true
   def init(st), do: {:ok, st}
+
+  @impl true
+  def handle_info(_msg, st), do: {:noreply, st}
 
   @impl true
   def handle_call({:register, proto, fun}, _from, st) do
     {:reply, :ok, %{st | handlers: Map.put(st.handlers, proto, fun)}}
   end
 
+  def handle_call({:get_handler, proto}, _from, st) do
+    case Map.fetch(st.handlers, proto) do
+      {:ok, fun} -> {:reply, {:ok, fun, st.codec}, st}
+      :error -> {:reply, :error, st}
+    end
+  end
+
   def handle_call({:request, conn, proto, req_bytes, codec_override, timeout}, _from, st) do
     codec = codec_override || st.codec
 
-    with :ok <- Connection.await_ready(conn, timeout),
-         {:ok, stream_id} <- Connection.open_stream(conn),
-         {:ok, selected, _initial} <-
-           Libp2p.StreamNegotiator.negotiate_outbound(conn, stream_id, [proto], MapSet.new([proto]), timeout: timeout),
-         true <- selected == proto,
-         :ok <- Connection.stream_send(conn, stream_id, encode(codec, req_bytes)),
-         {:ok, resp} <- recv_one(conn, stream_id, codec, timeout) do
-      _ = Connection.stream_close(conn, stream_id)
-      {:reply, {:ok, resp}, st}
-    else
-      {:error, reason} -> {:reply, {:error, reason}, st}
-      false -> {:reply, {:error, :unexpected_protocol}, st}
-      other -> {:reply, {:error, other}, st}
+    # Eager MSS: send header + proposal in one go
+    mss = Libp2p.MultistreamSelect.new_initiator([proto])
+    {out0, mss} = Libp2p.MultistreamSelect.start(mss)
+
+    try do
+      with {:ok, stream_id} <- ConnectionV2.open_stream(conn, out0),
+           {:ok, leftover} <- negotiate(conn, stream_id, mss, timeout),
+           :ok <- ConnectionV2.send_stream(conn, stream_id, encode(codec, req_bytes)),
+           :ok <- ConnectionV2.close_stream(conn, stream_id),
+           {:ok, resp} <- recv_one(conn, stream_id, codec, timeout, leftover) do
+        {:reply, {:ok, resp}, st}
+      else
+        {:error, reason} -> {:reply, {:error, reason}, st}
+        other -> {:reply, {:error, other}, st}
+      end
+    catch
+      :exit, _reason ->
+        {:reply, {:error, :connection_closed}, st}
     end
   end
 
-  @impl true
-  def handle_cast({:inbound, conn, stream_id, proto, initial}, st) do
-    server = self()
-    Task.start(fn -> inbound_task(server, st, conn, stream_id, proto, initial) end)
-    {:noreply, st}
+  defp negotiate(conn, stream_id, mss, timeout) do
+    receive do
+      {:libp2p, :stream_data, ^conn, ^stream_id, data} ->
+        {events, out, mss2} = Libp2p.MultistreamSelect.feed(mss, data, MapSet.new())
+        if out != <<>>, do: :ok = ConnectionV2.send_stream(conn, stream_id, out)
+
+        case Enum.find(events, fn e -> match?({:error, _}, e) end) do
+          {:error, reason} -> {:error, {:negotiation_failed, reason}}
+          _ ->
+            case Enum.find(events, fn e -> match?({:selected, _}, e) end) do
+              {:selected, _} -> {:ok, Map.get(mss2, :buf, <<>>)}
+              _ -> negotiate(conn, stream_id, mss2, timeout)
+            end
+        end
+
+      {:libp2p, :stream_closed, ^conn, ^stream_id} ->
+        {:error, :stream_closed}
+    after
+      timeout -> {:error, :timeout}
+    end
   end
 
-  # --- inbound ---
+  defp recv_one(conn, stream_id, {_enc, dec}, timeout, initial) do
+    do_recv_one(conn, stream_id, dec, timeout, initial)
+  end
 
-  defp inbound_task(_server, st, conn, stream_id, proto, initial) do
-    # Read one request, respond once, then close.
-    peer_id =
-      case Connection.remote_peer_id(conn) do
-        {:ok, pid} -> pid
-        _ -> <<>>
-      end
+  defp do_recv_one(conn, stream_id, dec, timeout, buf) do
+    case dec.(buf) do
+      {:ok, msg, _rest} ->
+        {:ok, msg}
 
-    case Map.get(st.handlers, proto) do
-      nil ->
-        _ = Connection.stream_close(conn, stream_id)
-        :ok
+      :more ->
+        receive do
+          {:libp2p, :stream_data, ^conn, ^stream_id, data} ->
+            do_recv_one(conn, stream_id, dec, timeout, buf <> data)
 
-      handler_fun ->
-        with {:ok, req} <- recv_one(conn, stream_id, st.codec, 10_000, initial) do
-          # Gate concurrency by {peer, proto}
-          key = {peer_id, proto}
-
-          reply =
-            ReqRespServer.handle(
-              st.concurrency_server,
-              key,
-              req,
-              fn request_bytes -> handler_fun.(peer_id, request_bytes) end,
-              max_concurrent: 2,
-              timeout: 10_000
-            )
-
-          case reply do
-            {:ok, resp_bytes} ->
-              _ = Connection.stream_send(conn, stream_id, encode(st.codec, resp_bytes))
-              _ = Connection.stream_close(conn, stream_id)
-              :ok
-
-            {:error, _} ->
-              _ = Connection.stream_close(conn, stream_id)
-              :ok
-          end
-        else
-          _ -> _ = Connection.stream_close(conn, stream_id)
+          {:libp2p, :stream_closed, ^conn, ^stream_id} ->
+            # Some responders might close after sending the full response
+            case dec.(buf) do
+              {:ok, msg, _rest} -> {:ok, msg}
+              _ -> {:error, :truncated}
+            end
+        after
+          timeout -> {:error, :timeout}
         end
     end
   end
-
-  # --- framing helpers ---
 
   defp default_codec do
     {
@@ -161,21 +177,4 @@ defmodule Libp2p.RequestResponse do
   end
 
   defp encode({enc, _dec}, bytes), do: enc.(bytes)
-
-  defp recv_one(conn, stream_id, {_enc, dec}, timeout, initial \\ <<>>) do
-    do_recv_one(conn, stream_id, dec, timeout, initial)
-  end
-
-  defp do_recv_one(conn, stream_id, dec, timeout, buf) do
-    case dec.(buf) do
-      {:ok, msg, _rest} ->
-        {:ok, msg}
-
-      :more ->
-        case Connection.stream_recv(conn, stream_id, timeout) do
-          {:ok, data} -> do_recv_one(conn, stream_id, dec, timeout, buf <> data)
-          {:error, reason} -> {:error, reason}
-        end
-    end
-  end
 end

@@ -1,6 +1,30 @@
 defmodule Libp2p.Yamux.Session do
   @moduledoc """
-  Minimal yamux session state machine.
+  Manages a Yamux multiplexing session.
+
+  Yamux allows multiple concurrent streams to be multiplexed over a single reliable connection.
+  This module implements the session management, frame parsing, and flow control.
+
+  ## Framing
+
+  Every message in Yamux is prefixed with a 12-byte header containing:
+  - **Version**: (Always 0).
+  - **Type**: The message type (Data, WindowUpdate, Ping, GoAway).
+  - **Flags**: Modifiers like SYN (new stream), ACK (accept stream), FIN (close stream), RST (reset).
+  - **StreamID**: The identifier for the logical stream (0 is reserved for the session).
+  - **Length**: Payload length or control value.
+
+  ## Flow Control
+
+  Yamux uses a reliable credit-based flow control system to prevent fast senders from overwhelming
+  receivers.
+  - Each stream starts with a receiving window of 256KB.
+  - As data is consumed, `WindowUpdate` frames are sent to the peer to grant more sending credit.
+  - If the window is exhausted, the sender must pause until an update is received.
+
+  ## Stream IDs
+
+  To avoid collisions, clients (initiators) use odd stream IDs, and servers (listeners) use even stream IDs.
 
   This is a pure(ish) state machine that:
   - consumes inbound bytes -> frames -> events

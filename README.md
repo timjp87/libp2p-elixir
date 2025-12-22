@@ -17,37 +17,37 @@ Add `libp2p_elixir` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:libp2p_elixir, "~> 0.9.0"}
+    {:libp2p_elixir, "~> 0.9.1"}
   ]
 end
 ```
 
-## minimal Usage Example
+## Minimal Usage Example
 
 ### 1. Define a Protocol Handler
 
-Implement the `Libp2p.InboundStream` behaviour to handle incoming streams for your custom protocol.
+Implement a module with `handle_inbound/3` to handle incoming streams for your custom protocol.
 
 ```elixir
 defmodule MyApp.EchoHandler do
-  @behaviour Libp2p.InboundStream
   require Logger
 
   # Handle incoming streams for protocol "/echo/1.0.0"
-  def handle_stream(conn, stream_id) do
+  def handle_inbound(conn, stream_id, _initial_data) do
     Logger.info("New echo stream opened: StreamID #{stream_id}")
+    # Take ownership of the stream to receive messages
+    Libp2p.ConnectionV2.set_stream_handler(conn, stream_id, self())
     loop(conn, stream_id)
   end
 
   defp loop(conn, stream_id) do
-    # Receive messages from the connection process
     receive do
-      {:libp2p, :stream_data, ^conn, ^stream_id, data, _peer} ->
+      {:libp2p, :stream_data, ^conn, ^stream_id, data} ->
         # Echo the data back
-        Libp2p.ConnectionV2.send_data(conn, stream_id, data)
+        Libp2p.ConnectionV2.send_stream(conn, stream_id, data)
         loop(conn, stream_id)
 
-      {:libp2p, :stream_closed, ^conn, ^stream_id, _peer} ->
+      {:libp2p, :stream_closed, ^conn, ^stream_id} ->
         Logger.info("Stream closed")
     end
   end
@@ -97,8 +97,16 @@ You can use the swarm to dial other peers.
 {:ok, conn_pid} = Libp2p.Swarm.dial(Libp2p.Swarm, {127, 0, 0, 1}, 9001)
 
 # Open a new stream on the connection
-{:ok, stream_id} = Libp2p.ConnectionV2.open_stream(conn_pid, "/echo/1.0.0")
+{:ok, stream_id} = Libp2p.ConnectionV2.open_stream(conn_pid)
+
+# Negotiate the protocol
+{:ok, "/echo/1.0.0", _} = Libp2p.StreamNegotiator.negotiate_outbound(
+  conn_pid,
+  stream_id,
+  ["/echo/1.0.0"],
+  MapSet.new(["/echo/1.0.0"]) # Supported protocols
+)
 
 # Send data
-Libp2p.ConnectionV2.send_data(conn_pid, stream_id, "Hello Libp2p!")
+Libp2p.ConnectionV2.send_stream(conn_pid, stream_id, "Hello Libp2p!")
 ```

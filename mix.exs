@@ -4,7 +4,7 @@ defmodule Libp2p.MixProject do
   def project do
     [
       app: :libp2p_elixir,
-      version: "0.9.0",
+      version: "0.9.1",
       elixir: "~> 1.19",
       start_permanent: Mix.env() == :prod,
       description: description(),

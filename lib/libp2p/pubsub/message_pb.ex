@@ -16,7 +16,7 @@ defmodule Libp2p.Pubsub.MessagePB do
   }
   ```
 
-  This module supports `StrictNoSign` validation helpers (for Eth2 use).
+  This module supports `StrictNoSign` validation helpers.
   """
 
   alias Libp2p.Protobuf
@@ -35,12 +35,26 @@ defmodule Libp2p.Pubsub.MessagePB do
     # tag order: 1..6
     out = []
 
-    out = if Map.get(msg, :from) != nil, do: [Protobuf.encode_len_field(1, msg.from) | out], else: out
-    out = if Map.get(msg, :data) != nil, do: [Protobuf.encode_len_field(2, msg.data) | out], else: out
-    out = if Map.get(msg, :seqno) != nil, do: [Protobuf.encode_len_field(3, msg.seqno) | out], else: out
+    out =
+      if Map.get(msg, :from) != nil, do: [Protobuf.encode_len_field(1, msg.from) | out], else: out
+
+    out =
+      if Map.get(msg, :data) != nil, do: [Protobuf.encode_len_field(2, msg.data) | out], else: out
+
+    out =
+      if Map.get(msg, :seqno) != nil,
+        do: [Protobuf.encode_len_field(3, msg.seqno) | out],
+        else: out
+
     out = [Protobuf.encode_len_field(4, topic) | out]
-    out = if Map.get(msg, :signature) != nil, do: [Protobuf.encode_len_field(5, msg.signature) | out], else: out
-    out = if Map.get(msg, :key) != nil, do: [Protobuf.encode_len_field(6, msg.key) | out], else: out
+
+    out =
+      if Map.get(msg, :signature) != nil,
+        do: [Protobuf.encode_len_field(5, msg.signature) | out],
+        else: out
+
+    out =
+      if Map.get(msg, :key) != nil, do: [Protobuf.encode_len_field(6, msg.key) | out], else: out
 
     out |> Enum.reverse() |> IO.iodata_to_binary()
   end
@@ -71,11 +85,20 @@ defmodule Libp2p.Pubsub.MessagePB do
   @spec validate_strict_no_sign!(t()) :: :ok
   def validate_strict_no_sign!(msg) when is_map(msg) do
     cond do
-      Map.get(msg, :from) != nil -> raise ArgumentError, "StrictNoSign violation: from present"
-      Map.get(msg, :seqno) != nil -> raise ArgumentError, "StrictNoSign violation: seqno present"
-      Map.get(msg, :signature) != nil -> raise ArgumentError, "StrictNoSign violation: signature present"
-      Map.get(msg, :key) != nil -> raise ArgumentError, "StrictNoSign violation: key present"
-      true -> :ok
+      Map.get(msg, :from) != nil ->
+        raise ArgumentError, "StrictNoSign violation: from present"
+
+      Map.get(msg, :seqno) != nil ->
+        raise ArgumentError, "StrictNoSign violation: seqno present"
+
+      Map.get(msg, :signature) != nil ->
+        raise ArgumentError, "StrictNoSign violation: signature present"
+
+      Map.get(msg, :key) != nil ->
+        raise ArgumentError, "StrictNoSign violation: key present"
+
+      true ->
+        :ok
     end
   end
 

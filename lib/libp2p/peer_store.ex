@@ -2,7 +2,7 @@ defmodule Libp2p.PeerStore do
   @moduledoc """
   Minimal peer store for tracking addresses + supported protocols.
 
-  This is intentionally small: enough to power Eth2 libp2p must-haves.
+  This is a minimal implementation focusing on essential libp2p features.
   """
 
   use GenServer

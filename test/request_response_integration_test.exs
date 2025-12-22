@@ -4,6 +4,12 @@ defmodule Libp2p.RequestResponseIntegrationTest do
   alias Libp2p.{Identity, PeerStore, ReqRespServer, RequestResponse, Swarm}
   alias Libp2p.Transport.Tcp
 
+  setup do
+    _ = Registry.start_link(keys: :unique, name: Libp2p.PeerRegistry)
+    _ = Task.Supervisor.start_link(name: Libp2p.RpcStreamSupervisor)
+    :ok
+  end
+
   test "request-response round trip" do
     proto = "/test/reqresp/1"
 
@@ -24,7 +30,9 @@ defmodule Libp2p.RequestResponseIntegrationTest do
         peer_store: ps_a,
         connection_supervisor: cs_a,
         protocol_handlers: %{
-          proto => fn conn, sid, selected_proto, initial -> RequestResponse.handle_inbound(rr_a, conn, sid, selected_proto, initial) end
+          proto => fn conn, sid, selected_proto, initial ->
+            RequestResponse.handle_inbound(rr_a, conn, sid, selected_proto, initial)
+          end
         }
       )
 
@@ -39,7 +47,9 @@ defmodule Libp2p.RequestResponseIntegrationTest do
         peer_store: ps_b,
         connection_supervisor: cs_b,
         protocol_handlers: %{
-          proto => fn conn, sid, selected_proto, initial -> RequestResponse.handle_inbound(rr_b, conn, sid, selected_proto, initial) end
+          proto => fn conn, sid, selected_proto, initial ->
+            RequestResponse.handle_inbound(rr_b, conn, sid, selected_proto, initial)
+          end
         }
       )
 
@@ -49,6 +59,7 @@ defmodule Libp2p.RequestResponseIntegrationTest do
     {:ok, conn_pid} = Swarm.dial(swarm_b, {127, 0, 0, 1}, port, timeout: 20_000)
     assert :ok = Libp2p.Connection.await_ready(conn_pid, 10_000)
 
-    assert {:ok, "pong:ping"} = RequestResponse.request(rr_b, conn_pid, proto, "ping", timeout: 10_000)
+    assert {:ok, "pong:ping"} =
+             RequestResponse.request(rr_b, conn_pid, proto, "ping", timeout: 10_000)
   end
 end

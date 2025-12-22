@@ -9,7 +9,9 @@ defmodule Libp2p.RequestResponse do
   alias Libp2p.RequestResponse.Framing
 
   @type proto_id :: binary()
-  @type codec :: {encode :: (binary() -> binary()), decode :: (binary() -> {:ok, binary(), binary()} | :more)}
+  @type codec ::
+          {encode :: (binary() -> binary()),
+           decode :: (binary() -> {:ok, binary(), binary()} | :more)}
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
@@ -19,9 +21,17 @@ defmodule Libp2p.RequestResponse do
     codec = Keyword.get(opts, :codec, default_codec())
 
     if Keyword.has_key?(opts, :name) and name == nil do
-      GenServer.start_link(__MODULE__, %{handlers: handlers, concurrency_server: server, codec: codec})
+      GenServer.start_link(__MODULE__, %{
+        handlers: handlers,
+        concurrency_server: server,
+        codec: codec
+      })
     else
-      GenServer.start_link(__MODULE__, %{handlers: handlers, concurrency_server: server, codec: codec}, name: name)
+      GenServer.start_link(
+        __MODULE__,
+        %{handlers: handlers, concurrency_server: server, codec: codec},
+        name: name
+      )
     end
   end
 
@@ -36,11 +46,42 @@ defmodule Libp2p.RequestResponse do
   @doc """
   Perform an outbound request over a connection.
   """
-  @spec request(pid() | atom(), pid(), proto_id(), binary(), keyword()) :: {:ok, binary()} | {:error, term()}
-  def request(rr, conn, proto, req_bytes, opts \\ []) when is_binary(proto) and is_binary(req_bytes) do
+  @spec request(pid() | atom(), pid(), proto_id(), binary(), keyword()) ::
+          {:ok, binary()} | {:error, term()}
+  def request(rr, conn, proto, req_bytes, opts \\ [])
+      when is_binary(proto) and is_binary(req_bytes) do
     timeout = Keyword.get(opts, :timeout, 10_000)
-    codec = Keyword.get(opts, :codec, nil)
-    GenServer.call(rr, {:request, conn, proto, req_bytes, codec, timeout}, timeout + 1_000)
+    codec = Keyword.get(opts, :codec, nil) || GenServer.call(rr, :get_codec)
+
+    Task.Supervisor.async(Libp2p.RpcStreamSupervisor, fn ->
+      do_request(conn, proto, req_bytes, codec, timeout)
+    end)
+    |> Task.await(timeout + 5000)
+  rescue
+    _ -> {:error, :request_failed}
+  end
+
+  defp do_request(conn, proto, req_bytes, codec, timeout) do
+    # Eager MSS: send header + proposal in one go
+    mss = Libp2p.MultistreamSelect.new_initiator([proto])
+    {out0, mss} = Libp2p.MultistreamSelect.start(mss)
+
+    try do
+      with {:ok, stream_id} <- ConnectionV2.open_stream(conn, out0),
+           :ok <- ConnectionV2.set_stream_handler(conn, stream_id, self()),
+           {:ok, leftover} <- negotiate(conn, stream_id, mss, timeout),
+           :ok <- ConnectionV2.send_stream(conn, stream_id, encode(codec, req_bytes)),
+           :ok <- ConnectionV2.close_stream(conn, stream_id),
+           {:ok, resp} <- recv_one(conn, stream_id, codec, timeout, leftover) do
+        {:ok, resp}
+      else
+        {:error, reason} -> {:error, reason}
+        other -> {:error, other}
+      end
+    catch
+      :exit, _reason ->
+        {:error, :connection_closed}
+    end
   end
 
   @doc """
@@ -50,10 +91,7 @@ defmodule Libp2p.RequestResponse do
   def handle_inbound(rr, conn, stream_id, proto, initial) do
     case GenServer.call(rr, {:get_handler, proto}) do
       {:ok, handler, codec} ->
-        # We might need to handle negotiation if initial is empty?
-        # But handle_inbound is usually called *after* MSS selection.
-        # However, we need to handle the framing.
-
+        # Framing is handled here by the task
         case recv_one(conn, stream_id, codec, 20_000, initial) do
           {:ok, req_bytes} ->
             {:ok, peer_id} = ConnectionV2.remote_peer_id(conn)
@@ -85,34 +123,16 @@ defmodule Libp2p.RequestResponse do
     {:reply, :ok, %{st | handlers: Map.put(st.handlers, proto, fun)}}
   end
 
+  @impl true
+  def handle_call(:get_codec, _from, st) do
+    {:reply, st.codec, st}
+  end
+
+  @impl true
   def handle_call({:get_handler, proto}, _from, st) do
     case Map.fetch(st.handlers, proto) do
       {:ok, fun} -> {:reply, {:ok, fun, st.codec}, st}
       :error -> {:reply, :error, st}
-    end
-  end
-
-  def handle_call({:request, conn, proto, req_bytes, codec_override, timeout}, _from, st) do
-    codec = codec_override || st.codec
-
-    # Eager MSS: send header + proposal in one go
-    mss = Libp2p.MultistreamSelect.new_initiator([proto])
-    {out0, mss} = Libp2p.MultistreamSelect.start(mss)
-
-    try do
-      with {:ok, stream_id} <- ConnectionV2.open_stream(conn, out0),
-           {:ok, leftover} <- negotiate(conn, stream_id, mss, timeout),
-           :ok <- ConnectionV2.send_stream(conn, stream_id, encode(codec, req_bytes)),
-           :ok <- ConnectionV2.close_stream(conn, stream_id),
-           {:ok, resp} <- recv_one(conn, stream_id, codec, timeout, leftover) do
-        {:reply, {:ok, resp}, st}
-      else
-        {:error, reason} -> {:reply, {:error, reason}, st}
-        other -> {:reply, {:error, other}, st}
-      end
-    catch
-      :exit, _reason ->
-        {:reply, {:error, :connection_closed}, st}
     end
   end
 
@@ -123,7 +143,9 @@ defmodule Libp2p.RequestResponse do
         if out != <<>>, do: :ok = ConnectionV2.send_stream(conn, stream_id, out)
 
         case Enum.find(events, fn e -> match?({:error, _}, e) end) do
-          {:error, reason} -> {:error, {:negotiation_failed, reason}}
+          {:error, reason} ->
+            {:error, {:negotiation_failed, reason}}
+
           _ ->
             case Enum.find(events, fn e -> match?({:selected, _}, e) end) do
               {:selected, _} -> {:ok, Map.get(mss2, :buf, <<>>)}

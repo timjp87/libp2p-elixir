@@ -12,6 +12,7 @@ defmodule Libp2p.Swarm do
   """
 
   use GenServer
+  require Logger
 
   alias Libp2p.StreamNegotiator
   alias Libp2p.Transport.Tcp
@@ -33,7 +34,8 @@ defmodule Libp2p.Swarm do
   @doc """
   Start listening on `{ip, port}`.
   """
-  @spec listen(t(), :inet.ip_address(), :inet.port_number()) :: {:ok, Tcp.socket()} | {:error, term()}
+  @spec listen(t(), :inet.ip_address(), :inet.port_number()) ::
+          {:ok, Tcp.socket()} | {:error, term()}
   def listen(swarm, ip, port) do
     GenServer.call(swarm, {:listen, ip, port})
   end
@@ -46,7 +48,8 @@ defmodule Libp2p.Swarm do
     dial(swarm, ip, port, [])
   end
 
-  @spec dial(t(), :inet.ip_address(), :inet.port_number(), keyword()) :: {:ok, pid()} | {:error, term()}
+  @spec dial(t(), :inet.ip_address(), :inet.port_number(), keyword()) ::
+          {:ok, pid()} | {:error, term()}
   def dial(swarm, ip, port, opts) do
     timeout = Keyword.get(opts, :timeout, 20_000)
     GenServer.call(swarm, {:dial, ip, port, timeout}, timeout + 1_000)
@@ -57,11 +60,13 @@ defmodule Libp2p.Swarm do
     identity = Keyword.fetch!(opts, :identity)
     peer_store = Keyword.fetch!(opts, :peer_store)
     conn_sup = Keyword.fetch!(opts, :connection_supervisor)
+    peer_session_sup = Keyword.get(opts, :peer_session_supervisor)
 
     st = %{
       identity: identity,
       peer_store: peer_store,
       connection_supervisor: conn_sup,
+      peer_session_supervisor: peer_session_sup,
       listeners: %{},
       connections: MapSet.new(),
       streams: %{},
@@ -77,6 +82,7 @@ defmodule Libp2p.Swarm do
     case Tcp.listen(ip, port) do
       {:ok, listener} ->
         swarm_pid = self()
+
         accept_pid =
           spawn_link(fn ->
             accept_loop(%{
@@ -102,8 +108,11 @@ defmodule Libp2p.Swarm do
     case start_connection(st, :outbound, {ip, port}) do
       {:ok, pid} ->
         case Libp2p.ConnectionV2.await_ready(pid, ready_timeout) do
-          :ok -> {:reply, {:ok, pid}, st}
-          {:error, reason} -> {:reply, {:error, reason}, st}
+          :ok ->
+            {:reply, {:ok, pid}, st}
+
+          {:error, reason} ->
+            {:reply, {:error, reason}, st}
         end
 
       {:error, reason} ->
@@ -112,26 +121,20 @@ defmodule Libp2p.Swarm do
   end
 
   @impl true
-  def handle_info({:inbound_stream, conn, stream_id}, st) do
+  def handle_info({:libp2p, :stream_open, conn, stream_id, _peer_id}, st) do
     supported = MapSet.new(Map.keys(st.protocol_handlers))
 
     # We monitor the task to clean up streams map when it exits
-    {%Task{pid: pid}, _} =
-      Task.Supervisor.start_child(Libp2p.TaskSupervisor, fn ->
-        # Optimize: try to take ownership directly to bypass Swarm for future data
-        # (This handles the race where data comes *after* this call, while Swarm/handle_info handles data *before*)
-        try do
-           Libp2p.ConnectionV2.set_stream_handler(conn, stream_id, self())
-        rescue
-           # Connection might be V1 or closed
-           _ -> :ok
-        end
+    {:ok, pid} =
+      Task.Supervisor.start_child(Libp2p.RpcStreamSupervisor, fn ->
+        # Take ownership directly to bypass Swarm for future data
+        Libp2p.ConnectionV2.set_stream_handler(conn, stream_id, self())
 
         case StreamNegotiator.negotiate_inbound(conn, stream_id, supported) do
           {:ok, proto, initial} ->
             case Map.get(st.protocol_handlers, proto) do
               nil ->
-                _ = Libp2p.Connection.stream_close(conn, stream_id)
+                _ = Libp2p.ConnectionV2.close_stream(conn, stream_id)
                 :ok
 
               handler when is_function(handler, 3) ->
@@ -150,7 +153,7 @@ defmodule Libp2p.Swarm do
                       handler_mod.handle_inbound(conn, stream_id, initial)
 
                     true ->
-                      _ = Libp2p.Connection.stream_close(conn, stream_id)
+                      _ = Libp2p.ConnectionV2.close_stream(conn, stream_id)
                       :error
                   end
 
@@ -159,12 +162,13 @@ defmodule Libp2p.Swarm do
                     # Transfer ownership to the new handler process
                     Libp2p.ConnectionV2.set_stream_handler(conn, stream_id, pid)
 
-                  _ -> :ok
+                  _ ->
+                    :ok
                 end
             end
 
           {:error, _} ->
-            _ = Libp2p.Connection.stream_close(conn, stream_id)
+            _ = Libp2p.ConnectionV2.close_stream(conn, stream_id)
             :ok
         end
       end)
@@ -173,26 +177,24 @@ defmodule Libp2p.Swarm do
     {:noreply, %{st | streams: Map.put(st.streams, stream_id, pid)}}
   end
 
-  def handle_info({:libp2p, :stream_data, _conn, stream_id, _data, _peer} = msg, st) do
-    case Map.get(st.streams, stream_id) do
-      pid when is_pid(pid) -> send(pid, msg)
-      _ -> :ok # Drop if no handler known (or already finished)
-    end
-    {:noreply, st}
-  end
+  def handle_info({:libp2p, :conn_ready, conn, peer_id}, st) do
+    if st.peer_session_supervisor do
+      # Start PeerSession if not already present
+      case Libp2p.PeerSessionSupervisor.start_peer_session(peer_id) do
+        {:ok, _} ->
+          :ok
 
-  def handle_info({:libp2p, :stream_closed, _conn, stream_id, _peer} = msg, st) do
-    case Map.get(st.streams, stream_id) do
-      pid when is_pid(pid) -> send(pid, msg)
-      _ -> :ok
-    end
-    # We don't remove from map yet, we wait for task DOWN?
-    # Or we can remove now if we know task will exit?
-    # Protocol handler might do cleanup.
-    {:noreply, st}
-  end
+        {:error, {:already_started, _}} ->
+          :ok
 
-  def handle_info({:connection_ready, conn, peer_id}, st) do
+        {:error, reason} ->
+          Logger.error("Failed to start peer session for #{peer_id}: #{inspect(reason)}")
+      end
+
+      # Register the connection with the session
+      Libp2p.PeerSession.register_connection(peer_id, conn)
+    end
+
     if is_pid(st.gossipsub) or is_atom(st.gossipsub) do
       _ = Libp2p.Gossipsub.peer_connected(st.gossipsub, peer_id, conn)
     end
@@ -236,17 +238,21 @@ defmodule Libp2p.Swarm do
          socket: sock,
          identity: ctx.identity,
          peer_store: ctx.peer_store,
-         handler: ctx.swarm, # notify Swarm on stream events
-         notify_conn_ready?: true, # notify Swarm when connection ready
+         # notify Swarm on stream events
+         handler: ctx.swarm,
+         # notify Swarm when connection ready
+         notify_conn_ready?: true,
          noise_prologue: "",
-         noise_hash_protocol_name?: false # default compatibility
+         # default compatibility
+         noise_hash_protocol_name?: false
        ]}
 
     case DynamicSupervisor.start_child(ctx.connection_supervisor, child_spec) do
       {:ok, pid} ->
         case :gen_tcp.controlling_process(sock, pid) do
           :ok ->
-            send(pid, :start_socket) # V2 expects :start_socket or implicit start?
+            # V2 expects :start_socket or implicit start?
+            send(pid, :start_socket)
             # V2 listener logic usually sets active:once in init or handle_continue.
             # V2 Listener.ex sends :start_socket. ConnectionV2 handles it.
             {:ok, pid}
@@ -268,7 +274,8 @@ defmodule Libp2p.Swarm do
          dial: {ip, port},
          identity: st.identity,
          peer_store: st.peer_store,
-         handler: self(), # Swarm
+         # Swarm
+         handler: self(),
          notify_conn_ready?: true,
          noise_prologue: "",
          dial_timeout_ms: 5_000

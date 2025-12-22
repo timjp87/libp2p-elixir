@@ -4,6 +4,12 @@ defmodule Libp2p.IdentifyIntegrationTest do
   alias Libp2p.{Identity, PeerStore, Protocol, Swarm}
   alias Libp2p.Transport.Tcp
 
+  setup do
+    _ = Registry.start_link(keys: :unique, name: Libp2p.PeerRegistry)
+    _ = Task.Supervisor.start_link(name: Libp2p.RpcStreamSupervisor)
+    :ok
+  end
+
   test "identify request populates peerstore" do
     id_a = Identity.generate_secp256k1()
     id_b = Identity.generate_secp256k1()

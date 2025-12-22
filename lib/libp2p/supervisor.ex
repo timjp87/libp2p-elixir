@@ -9,7 +9,7 @@ defmodule Libp2p.Supervisor do
 
   use Supervisor
 
-  alias Libp2p.{Gossipsub, PeerStore, Protocol, Swarm}
+  alias Libp2p.{Gossipsub, PeerStore, Protocol, Swarm, PeerSessionSupervisor}
 
   @spec start_link(keyword()) :: Supervisor.on_start()
   def start_link(opts) do
@@ -24,14 +24,18 @@ defmodule Libp2p.Supervisor do
     gossipsub_name = Keyword.get(opts, :gossipsub_name, Gossipsub)
 
     children = [
+      {Registry, keys: :unique, name: Libp2p.PeerRegistry},
       {PeerStore, name: peer_store_name},
+      {PeerSessionSupervisor, name: Libp2p.PeerSessionSupervisor},
       {DynamicSupervisor, name: conn_sup_name, strategy: :one_for_one},
+      {Task.Supervisor, name: Libp2p.RpcStreamSupervisor},
       {Gossipsub, name: gossipsub_name},
       {Swarm,
        [
          name: swarm_name,
          peer_store: peer_store_name,
          connection_supervisor: conn_sup_name,
+         peer_session_supervisor: Libp2p.PeerSessionSupervisor,
          identity: Keyword.fetch!(opts, :identity),
          gossipsub: gossipsub_name,
          protocol_handlers:

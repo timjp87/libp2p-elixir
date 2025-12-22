@@ -4,7 +4,7 @@ defmodule Libp2p.MultistreamSelect do
 
   Used to negotiate:
   - connection-level protocols (security, muxer) and
-  - stream-level protocols (app protocols, e.g. eth2 req/resp).
+  - stream-level protocols (app protocols, e.g. request/response protocols).
   """
 
   alias Libp2p.Varint
@@ -143,15 +143,15 @@ defmodule Libp2p.MultistreamSelect do
     if st.selected != nil do
       {Enum.reverse(events), IO.iodata_to_binary(Enum.reverse(out)), st}
     else
-    case decode_message(st.buf) do
-      :more ->
-        {Enum.reverse(events), IO.iodata_to_binary(Enum.reverse(out)), st}
+      case decode_message(st.buf) do
+        :more ->
+          {Enum.reverse(events), IO.iodata_to_binary(Enum.reverse(out)), st}
 
-      {msg, rest} ->
-        st = %{st | buf: rest}
-        {events2, out2, st2} = handle_msg(st, supported, msg, events, out)
-        do_feed(st2, supported, events2, out2)
-    end
+        {msg, rest} ->
+          st = %{st | buf: rest}
+          {events2, out2, st2} = handle_msg(st, supported, msg, events, out)
+          do_feed(st2, supported, events2, out2)
+      end
     end
   end
 

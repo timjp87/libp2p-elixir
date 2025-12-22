@@ -29,11 +29,22 @@ defmodule Libp2p.ConnectionV2 do
   - Connection teardown (GoAway frames).
   """
 
-  use GenServer
+  @behaviour :gen_statem
+
+  @spec child_spec(keyword()) :: Supervisor.child_spec()
+  def child_spec(opts) do
+    %{
+      id: __MODULE__,
+      start: {__MODULE__, :start_link, [opts]},
+      type: :worker,
+      restart: :temporary,
+      shutdown: 500
+    }
+  end
 
   require Logger
 
-  alias Libp2p.{Identity, MultistreamSelect, Noise, PeerId, Registry}
+  alias Libp2p.{Identity, MultistreamSelect, Noise, PeerId, PeerSession}
   alias Libp2p.Yamux.Session, as: Yamux
 
   @sec_proposals ["/noise"]
@@ -43,50 +54,54 @@ defmodule Libp2p.ConnectionV2 do
 
   @type role :: :initiator | :responder
 
-  @spec start_link(keyword()) :: GenServer.on_start()
+  @spec start_link(keyword()) :: :gen_statem.start_ret()
   def start_link(opts) do
-    GenServer.start_link(__MODULE__, opts)
+    :gen_statem.start_link(__MODULE__, opts, [])
   end
 
   @spec remote_peer_id(pid()) :: {:ok, binary()} | {:error, term()}
-  def remote_peer_id(conn), do: GenServer.call(conn, :remote_peer_id)
+  def remote_peer_id(conn), do: :gen_statem.call(conn, :remote_peer_id)
 
   @spec await_ready(pid(), timeout()) :: :ok | {:error, term()}
   def await_ready(conn, timeout \\ 20_000) do
-    GenServer.call(conn, :await_ready, timeout)
+    :gen_statem.call(conn, :await_ready, timeout)
   end
 
   @spec open_stream(pid()) :: {:ok, non_neg_integer()} | {:error, term()}
-  def open_stream(conn) when is_pid(conn), do: GenServer.call(conn, :open_stream, 30_000)
+  def open_stream(conn) when is_pid(conn), do: :gen_statem.call(conn, :open_stream, 30_000)
 
   @spec open_stream(pid(), binary()) :: {:ok, non_neg_integer()} | {:error, term()}
   def open_stream(conn, initial_data) when is_pid(conn) and is_binary(initial_data),
-    do: GenServer.call(conn, {:open_stream, initial_data}, 30_000)
+    do: :gen_statem.call(conn, {:open_stream, initial_data}, 30_000)
 
   @spec send_stream(pid(), non_neg_integer(), binary()) :: :ok | {:error, term()}
-  def send_stream(conn, stream_id, data) when is_pid(conn) and is_integer(stream_id) and is_binary(data),
-    do: GenServer.call(conn, {:send_stream, stream_id, data})
+  def send_stream(conn, stream_id, data)
+      when is_pid(conn) and is_integer(stream_id) and is_binary(data),
+      do: :gen_statem.call(conn, {:send_stream, stream_id, data})
 
   @spec close_stream(pid(), non_neg_integer()) :: :ok | {:error, term()}
   def close_stream(conn, stream_id) when is_pid(conn) and is_integer(stream_id),
-    do: GenServer.call(conn, {:close_stream, stream_id})
+    do: :gen_statem.call(conn, {:close_stream, stream_id})
 
   @spec peer_store(pid()) :: pid() | atom()
-  def peer_store(conn), do: GenServer.call(conn, :peer_store)
+  def peer_store(conn), do: :gen_statem.call(conn, :peer_store)
 
   @doc "Reset (RST) a yamux stream."
   @spec reset_stream(pid() | atom(), non_neg_integer()) :: :ok | {:error, term()}
   def reset_stream(conn, stream_id) do
-    GenServer.call(conn, {:reset_stream, stream_id})
+    :gen_statem.call(conn, {:reset_stream, stream_id})
   end
 
   @doc "Set the process that will receive stream events."
   @spec set_stream_handler(pid(), non_neg_integer(), pid()) :: :ok
   def set_stream_handler(conn, stream_id, pid) do
-    GenServer.call(conn, {:set_stream_handler, stream_id, pid})
+    :gen_statem.call(conn, {:set_stream_handler, stream_id, pid})
   end
 
-  @impl true
+  @impl :gen_statem
+  def callback_mode, do: [:handle_event_function, :state_enter]
+
+  @impl :gen_statem
   def init(opts) do
     role = Keyword.fetch!(opts, :role)
     %Identity{} = identity = Keyword.fetch!(opts, :identity)
@@ -96,29 +111,22 @@ defmodule Libp2p.ConnectionV2 do
     enforce_expected_peer_id? = Keyword.get(opts, :enforce_expected_peer_id?, true)
     peer_store = Keyword.get(opts, :peer_store, Libp2p.PeerStore)
 
-    dial_timeout_ms =
-      Keyword.get(
-        opts,
-        :dial_timeout_ms,
-        3_000
-      )
-
+    dial_timeout_ms = Keyword.get(opts, :dial_timeout_ms, 3_000)
     noise_prologue = Keyword.get(opts, :noise_prologue, <<>>)
     noise_hash_protocol_name? = Keyword.get(opts, :noise_hash_protocol_name?, false)
     noise_hkdf_swap? = Keyword.get(opts, :noise_hkdf_swap?, false)
     noise_nonce_be? = Keyword.get(opts, :noise_nonce_be?, false)
 
-    {socket_info, initial_state_update, socket_opts} =
+    {socket_info, _initial_phase, socket_opts} =
       case role do
         :initiator ->
           {ip, port} = Keyword.fetch!(opts, :dial)
-          GenServer.cast(self(), :connect)
-          {{:outbound, nil, {ip, port}}, %{phase: :connecting}, []}
+          {{:outbound, nil, {ip, port}}, :connecting, []}
 
         :responder ->
           sock = Keyword.fetch!(opts, :socket)
           {:ok, {ip, port}} = :inet.peername(sock)
-          {{:inbound, sock, {ip, port}}, %{phase: :mss_security}, [active: :once]}
+          {{:inbound, sock, {ip, port}}, :mss_security, [active: :once]}
       end
 
     {_dir, sock, peer_addr} = socket_info
@@ -128,30 +136,14 @@ defmodule Libp2p.ConnectionV2 do
       event: "p2p_conn_init",
       role: role,
       peer_addr: inspect(peer_addr),
-      expected_peer_id: expected_peer_id,
-      noise: %{
-        prologue_len: byte_size(noise_prologue),
-        hash_protocol_name?: noise_hash_protocol_name?,
-        hkdf_swap?: noise_hkdf_swap?,
-        nonce_be?: noise_nonce_be?
-      }
+      expected_peer_id: expected_peer_id
     })
 
-    # security multistream-select (plaintext)
     mss =
       case role do
         :initiator -> MultistreamSelect.new_initiator(@sec_proposals)
         :responder -> MultistreamSelect.new_responder()
       end
-
-    {out0, mss} =
-      if role == :responder do
-        MultistreamSelect.start(mss)
-      else
-        {<<>>, mss}
-      end
-
-    if out0 != <<>> and is_port(sock), do: :ok = :gen_tcp.send(sock, out0)
 
     noise =
       Noise.new(
@@ -163,7 +155,7 @@ defmodule Libp2p.ConnectionV2 do
         noise_nonce_be?
       )
 
-    st = %{
+    data = %{
       role: role,
       sock: sock,
       peer_addr: peer_addr,
@@ -175,9 +167,7 @@ defmodule Libp2p.ConnectionV2 do
       remote_peer_id: nil,
       peer_store: peer_store,
       notify_ready: Keyword.get(opts, :notify_ready),
-      # plaintext MSS + noise handshake buffers
       mss_state: mss,
-      phase: initial_state_update.phase,
       dial_timeout_ms: dial_timeout_ms,
       buf: <<>>,
       noise: noise,
@@ -189,499 +179,539 @@ defmodule Libp2p.ConnectionV2 do
       noise_hash_protocol_name?: noise_hash_protocol_name?,
       noise_hkdf_swap?: noise_hkdf_swap?,
       noise_nonce_be?: noise_nonce_be?,
-      # muxer MSS over noise
       mux_mss_state: nil,
-      # yamux
       yamux: nil,
       yamux_stream_owners: %{},
+      yamux_stream_buffers: %{},
+      yamux_stream_waiters: %{},
       ready_waiters: []
     }
 
-    {:ok, st}
-  end
-
-  @impl true
-  def handle_cast(
-        :connect,
-        %{role: :initiator, peer_addr: {ip, port}, dial_timeout_ms: timeout} = st
-      ) do
-    case :gen_tcp.connect(ip, port, [:binary, active: :once, packet: 0, nodelay: true, keepalive: true], timeout) do
-      {:ok, sock} ->
-        {out, mss} = MultistreamSelect.start(st.mss_state)
-        if out != <<>>, do: :ok = :gen_tcp.send(sock, out)
-
-        st = %{st | sock: sock, phase: :mss_security, mss_state: mss}
-        :ok = :inet.setopts(sock, active: :once)
-        st = drive(st)
-        {:noreply, st}
-
-      {:error, reason} ->
-        {:stop, {:shutdown, {:dial_failed, {ip, port}, reason}}, st}
+    if role == :initiator do
+      {:ok, :connecting, data, [{:next_event, :internal, :connect}]}
+    else
+      {out, mss} = MultistreamSelect.start(data.mss_state)
+      if out != <<>>, do: :ok = :gen_tcp.send(sock, out)
+      {:ok, :mss_security, %{data | mss_state: mss}}
     end
   end
 
-  @impl true
-  def handle_call(:await_ready, _from, %{phase: :yamux} = st) do
-    {:reply, :ok, st}
+  @impl :gen_statem
+  def handle_event(:enter, _old, :connecting, _data) do
+    :keep_state_and_data
   end
 
-  def handle_call(:await_ready, from, st) do
-    {:noreply, %{st | ready_waiters: [from | st.ready_waiters]}}
+  @impl :gen_statem
+  def handle_event(:internal, :connect, :connecting, data) do
+    %{peer_addr: {ip, port}, dial_timeout_ms: timeout} = data
+
+    case :gen_tcp.connect(
+           ip,
+           port,
+           [:binary, active: :once, packet: 0, nodelay: true, keepalive: true],
+           timeout
+         ) do
+      {:ok, sock} ->
+        {out, mss} = MultistreamSelect.start(data.mss_state)
+        if out != <<>>, do: :ok = :gen_tcp.send(sock, out)
+        {:next_state, :mss_security, %{data | sock: sock, mss_state: mss}}
+
+      {:error, reason} ->
+        {:stop, {:shutdown, {:dial_failed, {ip, port}, reason}}}
+    end
   end
 
-  def handle_call(:remote_peer_id, _from, st), do: {:reply, {:ok, st.remote_peer_id}, st}
-
-# ...
-
-
-
-# ... (in finish_noise and handle_transport_plaintext)
-
-
-  def handle_call(:peer_store, _from, st), do: {:reply, st.peer_store, st}
-
-
-
-  def handle_call(:open_stream, {from_pid, _} = _from, %{phase: :yamux} = st) do
-    {id, out, y2} = Yamux.open_stream(st.yamux)
-    st = %{st | yamux: y2, yamux_stream_owners: Map.put(st.yamux_stream_owners, id, from_pid)}
-    st = send_transport(st, out)
-    {:reply, {:ok, id}, st}
+  @impl :gen_statem
+  def handle_event(:enter, _old_state, :mss_security, _data) do
+    # Logic is handled in init or transitioned to with actions
+    :keep_state_and_data
   end
 
-  def handle_call({:open_stream, initial_data}, {from_pid, _} = _from, %{phase: :yamux} = st)
-      when is_binary(initial_data) do
-    {id, out, y2} = Yamux.open_stream_with_data(st.yamux, initial_data)
-    st = %{st | yamux: y2, yamux_stream_owners: Map.put(st.yamux_stream_owners, id, from_pid)}
-    st = send_transport(st, out)
-    {:reply, {:ok, id}, st}
-  end
-
-  def handle_call(:open_stream, _from, st), do: {:reply, {:error, :not_ready}, st}
-
-  def handle_call({:open_stream, _initial_data}, _from, st),
-    do: {:reply, {:error, :not_ready}, st}
-
-  def handle_call({:send_stream, stream_id, data}, _from, %{phase: :yamux} = st) do
-    {out, y2} = Yamux.send_data(st.yamux, stream_id, data)
-    st = %{st | yamux: y2}
-    st = send_transport(st, out)
-    {:reply, :ok, st}
-  rescue
-    e ->
-      Logger.error("ConnectionV2.send_stream failed: #{inspect(e)}")
-      {:reply, {:error, :bad_stream}, st}
-  end
-
-  def handle_call({:send_stream, _stream_id, _data}, _from, st),
-    do: {:reply, {:error, :not_ready}, st}
-
-  def handle_call({:close_stream, stream_id}, _from, %{phase: :yamux} = st) do
-    {out, y2} = Yamux.close_stream(st.yamux, stream_id)
-    st = %{st | yamux: y2, yamux_stream_owners: Map.delete(st.yamux_stream_owners, stream_id)}
-    st = send_transport(st, out)
-    {:reply, :ok, st}
-  rescue
-    _ -> {:reply, {:error, :bad_stream}, st}
-  end
-
-  def handle_call({:close_stream, _stream_id}, _from, st), do: {:reply, {:error, :not_ready}, st}
-
-  def handle_call({:reset_stream, stream_id}, _from, %{phase: :yamux} = st) do
-    {out, y2} = Yamux.reset_stream(st.yamux, stream_id)
-    st = %{st | yamux: y2, yamux_stream_owners: Map.delete(st.yamux_stream_owners, stream_id)}
-    st = send_transport(st, out)
-    {:reply, :ok, st}
-  rescue
-    _ -> {:reply, {:error, :bad_stream}, st}
-  end
-
-  def handle_call({:reset_stream, _stream_id}, _from, st), do: {:reply, {:error, :not_ready}, st}
-
-  # V1 Compatibility Aliases
-  def handle_call({:stream_send, id, data}, from, st), do: handle_call({:send_stream, id, data}, from, st)
-  def handle_call({:stream_close, id}, from, st), do: handle_call({:close_stream, id}, from, st)
-
-  def handle_call({:set_stream_handler, stream_id, pid}, _from, %{phase: :yamux} = st) do
-    # If there is buffered data, we should probably forward it?
-    # But current implementation pushes data immediately.
-    # If handler was Swarm, Swarm dropped it.
-    # So we can only switch ownership for future data.
-    st = %{st | yamux_stream_owners: Map.put(st.yamux_stream_owners, stream_id, pid)}
-    {:reply, :ok, st}
-  end
-
-  def handle_call({:set_stream_handler, _stream_id, _pid}, _from, st), do: {:reply, {:error, :not_ready}, st}
-
-  @impl true
-  def handle_info({:tcp, sock, data}, %{sock: sock} = st) do
-    st = %{st | buf: st.buf <> data}
-    st = drive(st)
+  @impl :gen_statem
+  def handle_event(:info, {:tcp, sock, bin}, _state, %{sock: sock} = data) do
     :ok = :inet.setopts(sock, active: :once)
-    {:noreply, st}
+    {:keep_state, %{data | buf: data.buf <> bin}, [{:next_event, :internal, :drive}]}
   end
 
-  def handle_info(:start_socket, st) do
-    :ok = :inet.setopts(st.sock, active: :once)
-    st = drive(st)
-    {:noreply, st}
-  end
-
-  def handle_info({:tcp_closed, sock}, %{sock: sock} = st) do
-    Logger.debug(%{
-      event: "p2p_tcp_closed",
-      phase: st.phase,
-      peer_addr: inspect(st.peer_addr),
-      role: st.role,
-      remote_peer_id: st.remote_peer_id
-    })
-
-    # Best-effort: wake any tasks blocked waiting on stream events.
-    Enum.each(st.yamux_stream_owners, fn {stream_id, owner} ->
-      if is_pid(owner) do
-        send(owner, {:libp2p, :stream_closed, self(), stream_id})
-      end
-    end)
-
-    if is_binary(st.remote_peer_id), do: Registry.unregister(st.remote_peer_id)
-    {:stop, :normal, st}
-  end
-
-  def handle_info({:tcp_error, sock, reason}, %{sock: sock} = st) do
-    Logger.debug(%{
-      event: "p2p_tcp_error",
-      phase: st.phase,
-      peer_addr: inspect(st.peer_addr),
-      role: st.role,
-      reason: inspect(reason)
-    })
-
-    Enum.each(st.yamux_stream_owners, fn {stream_id, owner} ->
-      if is_pid(owner) do
-        send(owner, {:libp2p, :stream_closed, self(), stream_id})
-      end
-    end)
-
-    if is_binary(st.remote_peer_id), do: Registry.unregister(st.remote_peer_id)
-    {:stop, :normal, st}
-  end
-
-  defp drive(%{phase: :mss_security} = st) do
-    {events, out, mss2} = MultistreamSelect.feed(st.mss_state, st.buf, @sec_supported)
-    if out != <<>>, do: _ = :gen_tcp.send(st.sock, out)
-    st = %{st | mss_state: mss2, buf: mss2.buf}
+  @impl :gen_statem
+  def handle_event(:internal, :drive, :mss_security, data) do
+    {events, out, mss2} = MultistreamSelect.feed(data.mss_state, data.buf, @sec_supported)
+    if out != <<>>, do: _ = :gen_tcp.send(data.sock, out)
+    data = %{data | mss_state: mss2, buf: mss2.buf}
 
     case Enum.find(events, fn e -> match?({:selected, _}, e) end) do
       {:selected, "/noise"} ->
-        Logger.debug(%{
-          event: "p2p_security_selected",
-          peer_addr: inspect(st.peer_addr),
-          role: st.role,
-          selected: "/noise"
-        })
-
-        st = %{st | phase: :noise, noise_buf: st.buf, buf: <<>>}
-        st = start_noise(st)
-        drive_noise(st)
+        {:next_state, :noise, %{data | noise_buf: data.buf, buf: <<>>},
+         [{:next_event, :internal, :drive}]}
 
       _ ->
-        st
+        {:keep_state, data}
     end
   end
 
-  defp drive(%{phase: :noise} = st) do
-    st = %{st | noise_buf: st.noise_buf <> st.buf, buf: <<>>}
-    st = drive_noise(st)
-    st
+  @impl :gen_statem
+  def handle_event(:enter, _old_state, :noise, data) do
+    data = start_noise(data)
+    {:keep_state, data}
   end
 
-  defp drive(%{phase: :mss_muxer} = st) do
-    st = %{st | noise_buf: st.noise_buf <> st.buf, buf: <<>>}
-    st = drive_noise_transport(st)
-    st
+  @impl :gen_statem
+  def handle_event(:internal, :drive, :noise, data) do
+    data = %{data | noise_buf: data.noise_buf <> data.buf, buf: <<>>}
+
+    case drive_noise(data) do
+      {:ok, data} -> {:keep_state, data}
+      {:finish, data} -> finish_noise(data)
+      {:error, reason} -> {:stop, {:shutdown, reason}}
+    end
   end
 
-  defp drive(%{phase: :yamux} = st) do
-    st = %{st | noise_buf: st.noise_buf <> st.buf, buf: <<>>}
-    st = drive_noise_transport(st)
-    st
+  @impl :gen_statem
+  def handle_event(:enter, _old, :mss_muxer, _data) do
+    :keep_state_and_data
   end
 
-  defp start_noise(%{role: :initiator} = st) do
-    {msg1, noise2} = Noise.initiator_msg1(st.noise)
-    _ = :gen_tcp.send(st.sock, Noise.frame(msg1))
-    %{st | noise: noise2, noise_stage: :wait_msg2}
+  @impl :gen_statem
+  def handle_event(:internal, :drive, :mss_muxer, data) do
+    data = %{data | noise_buf: data.noise_buf <> data.buf, buf: <<>>}
+
+    case drive_noise_transport(data) do
+      {:ok, data} -> {:keep_state, data}
+      {:error, reason} -> {:stop, {:shutdown, reason}}
+    end
   end
 
-  defp start_noise(%{role: :responder} = st) do
-    %{st | noise_stage: :wait_msg1}
+  @impl :gen_statem
+  def handle_event(:internal, :drive, :yamux, data) do
+    data = %{data | noise_buf: data.noise_buf <> data.buf, buf: <<>>}
+
+    case drive_noise_transport(data) do
+      {:ok, data} -> {:keep_state, data}
+      {:error, reason} -> {:stop, {:shutdown, reason}}
+    end
   end
 
-  defp drive_noise(%{noise_stage: :wait_msg1} = st) do
-    case Noise.deframe(st.noise_buf) do
+  @impl :gen_statem
+  def handle_event(:enter, _old, :yamux, _data) do
+    :keep_state_and_data
+  end
+
+  @impl :gen_statem
+  def handle_event(:info, {:tcp_closed, sock}, _state, %{sock: sock} = data) do
+    cleanup_and_stop(data, :normal)
+  end
+
+  @impl :gen_statem
+  def handle_event(:info, {:tcp_error, sock, reason}, _state, %{sock: sock} = data) do
+    cleanup_and_stop(data, reason)
+  end
+
+  @impl :gen_statem
+  def handle_event(:info, :start_socket, _state, data) do
+    :ok = :inet.setopts(data.sock, active: :once)
+    {:keep_state, data, [{:next_event, :internal, :drive}]}
+  end
+
+  # Synchronous calls
+  @impl :gen_statem
+  def handle_event({:call, from}, :remote_peer_id, _state, data) do
+    {:keep_state, data, [{:reply, from, {:ok, data.remote_peer_id}}]}
+  end
+
+  @impl :gen_statem
+  def handle_event({:call, from}, :peer_store, _state, data) do
+    {:keep_state, data, [{:reply, from, data.peer_store}]}
+  end
+
+  @impl :gen_statem
+  def handle_event({:call, from}, :__local_identity__, _state, data) do
+    {:keep_state, data, [{:reply, from, data.identity}]}
+  end
+
+  @impl :gen_statem
+  def handle_event({:call, from}, :await_ready, state, data) do
+    if state == :yamux do
+      {:keep_state, data, [{:reply, from, :ok}]}
+    else
+      {:keep_state, %{data | ready_waiters: [from | data.ready_waiters]}}
+    end
+  end
+
+  @impl :gen_statem
+  def handle_event({:call, from}, :open_stream, :yamux, data) do
+    {id, out, y2} = Yamux.open_stream(data.yamux)
+    {from_pid, _} = from
+
+    data = %{
+      data
+      | yamux: y2,
+        yamux_stream_owners: Map.put(data.yamux_stream_owners, id, from_pid)
+    }
+
+    data = send_transport(data, out)
+    {:keep_state, data, [{:reply, from, {:ok, id}}]}
+  end
+
+  @impl :gen_statem
+  def handle_event({:call, from}, {:open_stream, initial_data}, :yamux, data) do
+    {id, out, y2} = Yamux.open_stream_with_data(data.yamux, initial_data)
+    {from_pid, _} = from
+
+    data = %{
+      data
+      | yamux: y2,
+        yamux_stream_owners: Map.put(data.yamux_stream_owners, id, from_pid)
+    }
+
+    data = send_transport(data, out)
+    {:keep_state, data, [{:reply, from, {:ok, id}}]}
+  end
+
+  @impl :gen_statem
+  def handle_event({:call, from}, {:send_stream, stream_id, bytes}, :yamux, data) do
+    {out, y2} = Yamux.send_data(data.yamux, stream_id, bytes)
+    data = %{data | yamux: y2}
+    data = send_transport(data, out)
+    {:keep_state, data, [{:reply, from, :ok}]}
+  rescue
+    _ -> {:keep_state, data, [{:reply, from, {:error, :bad_stream}}]}
+  end
+
+  @impl :gen_statem
+  def handle_event({:call, from}, {:close_stream, stream_id}, :yamux, data) do
+    {out, y2} = Yamux.close_stream(data.yamux, stream_id)
+    data = %{data | yamux: y2}
+    data = send_transport(data, out)
+    {:keep_state, data, [{:reply, from, :ok}]}
+  rescue
+    _ -> {:keep_state, data, [{:reply, from, {:error, :bad_stream}}]}
+  end
+
+  @impl :gen_statem
+  def handle_event({:call, from}, {:reset_stream, stream_id}, :yamux, data) do
+    {out, y2} = Yamux.reset_stream(data.yamux, stream_id)
+    data = %{data | yamux: y2}
+    data = send_transport(data, out)
+    {:keep_state, data, [{:reply, from, :ok}]}
+  rescue
+    _ -> {:keep_state, data, [{:reply, from, {:error, :bad_stream}}]}
+  end
+
+  @impl :gen_statem
+  def handle_event({:call, from}, {:stream_send, stream_id, bytes}, :yamux, data) do
+    handle_event({:call, from}, {:send_stream, stream_id, bytes}, :yamux, data)
+  end
+
+  @impl :gen_statem
+  def handle_event({:call, from}, {:stream_close, stream_id}, :yamux, data) do
+    handle_event({:call, from}, {:close_stream, stream_id}, :yamux, data)
+  end
+
+  @impl :gen_statem
+  def handle_event({:call, from}, {:stream_recv, stream_id}, :yamux, data) do
+    case Map.get(data.yamux_stream_buffers, stream_id) do
+      bytes when is_binary(bytes) and bytes != <<>> ->
+        {:keep_state,
+         %{data | yamux_stream_buffers: Map.put(data.yamux_stream_buffers, stream_id, <<>>)},
+         [{:reply, from, {:ok, bytes}}]}
+
+      _ ->
+        waiters = Map.get(data.yamux_stream_waiters, stream_id, [])
+
+        {:keep_state,
+         %{
+           data
+           | yamux_stream_waiters:
+               Map.put(data.yamux_stream_waiters, stream_id, waiters ++ [from])
+         }}
+    end
+  end
+
+  @impl :gen_statem
+  def handle_event({:call, from}, {:set_stream_handler, stream_id, pid}, :yamux, data) do
+    data = %{data | yamux_stream_owners: Map.put(data.yamux_stream_owners, stream_id, pid)}
+    # Flush existing buffer to the new owner
+    case Map.get(data.yamux_stream_buffers, stream_id, <<>>) do
+      <<>> ->
+        {:keep_state, data, [{:reply, from, :ok}]}
+
+      bytes ->
+        send(pid, {:libp2p, :stream_data, self(), stream_id, bytes})
+
+        {:keep_state,
+         %{data | yamux_stream_buffers: Map.put(data.yamux_stream_buffers, stream_id, <<>>)},
+         [{:reply, from, :ok}]}
+    end
+  end
+
+  @impl :gen_statem
+  def handle_event({:call, from}, _msg, _state, data) do
+    {:keep_state, data, [{:reply, from, {:error, :not_ready}}]}
+  end
+
+  # Private Logic
+  defp start_noise(%{role: :initiator} = data) do
+    {msg1, noise2} = Noise.initiator_msg1(data.noise)
+    _ = :gen_tcp.send(data.sock, Noise.frame(msg1))
+    %{data | noise: noise2, noise_stage: :wait_msg2}
+  end
+
+  defp start_noise(%{role: :responder} = data) do
+    %{data | noise_stage: :wait_msg1}
+  end
+
+  defp drive_noise(%{noise_stage: :wait_msg1} = data) do
+    case Noise.deframe(data.noise_buf) do
       :more ->
-        st
+        {:ok, data}
 
       {msg1, rest} ->
-        {msg2, noise2} = Noise.responder_msg2(st.noise, msg1)
-        _ = :gen_tcp.send(st.sock, Noise.frame(msg2))
-        %{st | noise: noise2, noise_buf: rest, noise_stage: :wait_msg3}
+        {msg2, noise2} = Noise.responder_msg2(data.noise, msg1)
+        _ = :gen_tcp.send(data.sock, Noise.frame(msg2))
+        {:ok, %{data | noise: noise2, noise_buf: rest, noise_stage: :wait_msg3}}
     end
   end
 
-  defp drive_noise(%{noise_stage: :wait_msg2} = st) do
-    case Noise.deframe(st.noise_buf) do
+  defp drive_noise(%{noise_stage: :wait_msg2} = data) do
+    case Noise.deframe(data.noise_buf) do
       :more ->
-        st
+        {:ok, data}
 
       {msg2, rest} ->
         try do
-          {msg3, noise2, {cs_out, cs_in}} = Noise.initiator_msg3(st.noise, msg2)
-          _ = :gen_tcp.send(st.sock, Noise.frame(msg3))
-          st = %{st | noise: noise2, noise_out: cs_out, noise_in: cs_in, noise_buf: rest}
-          finish_noise(st)
+          {msg3, noise2, {cs_out, cs_in}} = Noise.initiator_msg3(data.noise, msg2)
+          _ = :gen_tcp.send(data.sock, Noise.frame(msg3))
+          {:finish, %{data | noise: noise2, noise_out: cs_out, noise_in: cs_in, noise_buf: rest}}
         rescue
-          e in ArgumentError ->
-            exit({:shutdown, {:handshake_failed, Exception.message(e)}})
+          e in ArgumentError -> {:error, {:handshake_failed, Exception.message(e)}}
         end
     end
   end
 
-  defp drive_noise(%{noise_stage: :wait_msg3} = st) do
-    case Noise.deframe(st.noise_buf) do
+  defp drive_noise(%{noise_stage: :wait_msg3} = data) do
+    case Noise.deframe(data.noise_buf) do
       :more ->
-        st
+        {:ok, data}
 
       {msg3, rest} ->
         try do
-          {noise2, {cs_in, cs_out}} = Noise.responder_finish(st.noise, msg3)
-          st = %{st | noise: noise2, noise_out: cs_out, noise_in: cs_in, noise_buf: rest}
-          finish_noise(st)
+          {noise2, {cs_in, cs_out}} = Noise.responder_finish(data.noise, msg3)
+          {:finish, %{data | noise: noise2, noise_out: cs_out, noise_in: cs_in, noise_buf: rest}}
         rescue
-          e in ArgumentError ->
-            exit({:shutdown, {:handshake_failed, Exception.message(e)}})
+          e in ArgumentError -> {:error, {:handshake_failed, Exception.message(e)}}
         end
     end
   end
 
-  defp finish_noise(st) do
-    remote_peer_id = derive_remote_peer_id!(st)
+  defp finish_noise(data) do
+    remote_peer_id = derive_remote_peer_id!(data)
 
-    Logger.debug(%{
-      event: "p2p_noise_handshake_completed",
-      peer_addr: inspect(st.peer_addr),
-      role: st.role,
-      remote_peer_id: remote_peer_id
-    })
+    if data.enforce_expected_peer_id? and is_binary(data.expected_peer_id) and
+         data.expected_peer_id != remote_peer_id do
+      {:stop, {:shutdown, {:peer_id_mismatch, data.expected_peer_id, remote_peer_id}}}
+    else
+      data = %{data | remote_peer_id: remote_peer_id}
+      # Start PeerSession if not already present
+      _ = PeerSession.register_connection(remote_peer_id, self())
 
-    if st.enforce_expected_peer_id? and is_binary(st.expected_peer_id) and
-         st.expected_peer_id != remote_peer_id do
-      _ = :gen_tcp.close(st.sock)
-      exit({:shutdown, {:peer_id_mismatch, st.expected_peer_id, remote_peer_id}})
-    end
+      case Map.get(data.noise, :selected_stream_muxer, nil) do
+        "/yamux/1.0.0" ->
+          enter_yamux(data)
 
-    st = %{st | remote_peer_id: remote_peer_id}
+        nil ->
+          enter_mss_muxer(data)
 
-    case Map.get(st.noise, :selected_stream_muxer, nil) do
-      "/yamux/1.0.0" ->
-        y = Yamux.new(if(st.role == :initiator, do: :client, else: :server))
-        Registry.register(st.remote_peer_id, self())
-        st = %{st | phase: :yamux, yamux: y, mux_mss_state: nil}
-
-        if st.notify_conn_ready? and st.handler != nil do
-          send(st.handler, {:libp2p, :conn_ready, self(), st.remote_peer_id})
-        end
-
-        if st.notify_ready != nil do
-          send(st.notify_ready, {:libp2p, :conn_ready, self(), st.remote_peer_id})
-        end
-
-        st = notify_waiters(st)
-        drive_noise_transport(st)
-
-      nil ->
-        mss =
-          case st.role do
-            :initiator -> MultistreamSelect.new_initiator(@mux_proposals)
-            :responder -> MultistreamSelect.new_responder()
-          end
-
-        {out0, mss} = MultistreamSelect.start(mss)
-        st = if out0 != <<>>, do: send_transport(st, out0), else: st
-        st = %{st | mux_mss_state: mss, phase: :mss_muxer}
-        drive_noise_transport(st)
-
-      other ->
-        Logger.warning("unsupported negotiated stream muxer #{inspect(other)}")
-        st
+        other ->
+          Logger.warning("unsupported negotiated stream muxer #{inspect(other)}")
+          {:keep_state, data}
+      end
     end
   end
 
-  defp drive_noise_transport(st) do
-    case Noise.deframe(st.noise_buf) do
+  defp enter_yamux(data) do
+    y = Yamux.new(if(data.role == :initiator, do: :client, else: :server))
+
+    if Process.whereis(Libp2p.PeerRegistry),
+      do: Registry.register(Libp2p.PeerRegistry, data.remote_peer_id, nil)
+
+    data = %{data | yamux: y, mux_mss_state: nil}
+    notify_ready(data)
+    {:next_state, :yamux, data, [{:next_event, :internal, :drive}]}
+  end
+
+  defp enter_mss_muxer(data) do
+    mss =
+      case data.role do
+        :initiator -> MultistreamSelect.new_initiator(@mux_proposals)
+        :responder -> MultistreamSelect.new_responder()
+      end
+
+    {out0, mss} = MultistreamSelect.start(mss)
+    data = if out0 != <<>>, do: send_transport(data, out0), else: data
+    {:next_state, :mss_muxer, %{data | mux_mss_state: mss}, [{:next_event, :internal, :drive}]}
+  end
+
+  defp notify_ready(data) do
+    if data.notify_conn_ready? and data.handler != nil do
+      send(data.handler, {:libp2p, :conn_ready, self(), data.remote_peer_id})
+    end
+
+    if data.notify_ready != nil do
+      send(data.notify_ready, {:libp2p, :conn_ready, self(), data.remote_peer_id})
+    end
+
+    Enum.each(data.ready_waiters, fn from -> :gen_statem.reply(from, :ok) end)
+  end
+
+  defp drive_noise_transport(data) do
+    case Noise.deframe(data.noise_buf) do
       :more ->
-        st
+        {:ok, data}
 
       {ct, rest} ->
-        {pt, cs_in} = Noise.transport_decrypt(st.noise_in, ct, <<>>)
-        st = %{st | noise_in: cs_in, noise_buf: rest}
-        st = handle_transport_plaintext(st, pt)
-        drive_noise_transport(st)
+        {pt, cs_in} = Noise.transport_decrypt(data.noise_in, ct, <<>>)
+        data = %{data | noise_in: cs_in, noise_buf: rest}
+
+        case handle_transport_plaintext(data, pt) do
+          {:ok, data} -> drive_noise_transport(data)
+          res -> res
+        end
     end
   rescue
-    _ -> st
+    _ -> {:ok, data}
   end
 
-  defp handle_transport_plaintext(%{phase: :mss_muxer} = st, bytes) do
-    {events, out, mss2} = MultistreamSelect.feed(st.mux_mss_state, bytes, @mux_supported)
-
-    st = %{st | mux_mss_state: mss2}
-    st = if out != <<>>, do: send_transport(st, out), else: st
+  defp handle_transport_plaintext(%{mux_mss_state: mss} = data, bytes) when not is_nil(mss) do
+    {events, out, mss2} = MultistreamSelect.feed(mss, bytes, @mux_supported)
+    data = %{data | mux_mss_state: mss2}
+    data = if out != <<>>, do: send_transport(data, out), else: data
 
     case Enum.find(events, fn e -> match?({:selected, _}, e) end) do
       {:selected, "/yamux/1.0.0"} ->
-        y = Yamux.new(if(st.role == :initiator, do: :client, else: :server))
+        # Transition to yamux state, processing leftovers
+        y = Yamux.new(if(data.role == :initiator, do: :client, else: :server))
         leftover = Map.get(mss2, :buf, <<>>)
 
-        y2 =
-          if leftover != <<>> do
-            {events2, out2, y2} = Yamux.feed(y, leftover)
-            st2 = %{st | yamux: y2}
-            st2 = if out2 != <<>>, do: send_transport(st2, out2), else: st2
+        if Process.whereis(Libp2p.PeerRegistry),
+          do: Registry.register(Libp2p.PeerRegistry, data.remote_peer_id, nil)
 
-            Enum.each(events2, fn
-              {:stream_open, id} ->
-                if st2.handler != nil,
-                  do: send(st2.handler, {:libp2p, :stream_open, self(), id, st2.remote_peer_id})
+        data = %{data | yamux: y, mux_mss_state: nil}
+        notify_ready(data)
 
-              {:stream_data, id, data} ->
-                case Map.get(st2.yamux_stream_owners, id) do
-                  owner when is_pid(owner) ->
-                    send(owner, {:libp2p, :stream_data, self(), id, data})
-
-                  _ ->
-                    if st2.handler != nil,
-                      do: send(st2.handler, {:libp2p, :stream_data, self(), id, data, st2.remote_peer_id})
-                end
-
-              {:stream_close, id} ->
-                if st2.handler != nil,
-                  do: send(st2.handler, {:libp2p, :stream_closed, self(), id, st2.remote_peer_id})
-
-              _ ->
-                :ok
-            end)
-
-            st2.yamux
-          else
-            y
-          end
-
-        Registry.register(st.remote_peer_id, self())
-        st2 = %{st | phase: :yamux, yamux: y2, mux_mss_state: nil}
-
-        if st2.notify_conn_ready? and st2.handler != nil do
-          send(st2.handler, {:libp2p, :conn_ready, self(), st2.remote_peer_id})
+        if leftover != <<>> do
+          {:next_state, :yamux, data, [{:next_event, :internal, :drive}]}
+        else
+          {:next_state, :yamux, data}
         end
-
-        if st2.notify_ready != nil do
-          send(st2.notify_ready, {:libp2p, :conn_ready, self(), st2.remote_peer_id})
-        end
-
-        st2 = notify_waiters(st2)
-        st2
 
       _ ->
-        st
+        {:ok, data}
     end
   end
 
-  defp handle_transport_plaintext(%{phase: :yamux} = st, bytes) do
-    {events, out, y2} = Yamux.feed(st.yamux, bytes)
-    st = %{st | yamux: y2}
-    st = if out != <<>>, do: send_transport(st, out), else: st
+  defp handle_transport_plaintext(data, bytes) do
+    {events, out, y2} = Yamux.feed(data.yamux, bytes)
+    data = %{data | yamux: y2}
+    data = if out != <<>>, do: send_transport(data, out), else: data
 
-    Enum.reduce(events, st, fn
-      {:stream_open, id}, acc ->
-        if acc.handler != nil,
-          do: send(acc.handler, {:libp2p, :stream_open, self(), id, acc.remote_peer_id})
-
-        acc
-
-      {:stream_data, id, data}, acc ->
-        case Map.get(acc.yamux_stream_owners, id) do
-          owner when is_pid(owner) ->
-            Logger.debug("ConnectionV2 dispatching #{byte_size(data)} bytes to owner #{inspect(owner)}")
-            send(owner, {:libp2p, :stream_data, self(), id, data})
-
-          _ ->
-            if acc.handler != nil do
-              Logger.debug("ConnectionV2 dispatching #{byte_size(data)} bytes to handler #{inspect(acc.handler)}")
-              send(acc.handler, {:libp2p, :stream_data, self(), id, data, acc.remote_peer_id})
+    data =
+      Enum.reduce(events, data, fn event, data_acc ->
+        case event do
+          {:stream_open, id} ->
+            if data_acc.handler != nil do
+              send(data_acc.handler, {:libp2p, :stream_open, self(), id, data_acc.remote_peer_id})
             end
-        end
 
-        acc
+            data_acc
 
-      {:stream_close, id}, acc ->
-        case Map.get(acc.yamux_stream_owners, id) do
-          owner when is_pid(owner) ->
-            send(owner, {:libp2p, :stream_closed, self(), id})
+          {:stream_data, id, bytes} ->
+            case Map.get(data_acc.yamux_stream_owners, id) do
+              owner when is_pid(owner) ->
+                send(owner, {:libp2p, :stream_data, self(), id, bytes})
+                data_acc
+
+              _ ->
+                case Map.get(data_acc.yamux_stream_waiters, id) do
+                  [from | rest] ->
+                    :gen_statem.reply(from, {:ok, bytes})
+
+                    %{
+                      data_acc
+                      | yamux_stream_waiters: Map.put(data_acc.yamux_stream_waiters, id, rest)
+                    }
+
+                  _ ->
+                    old_buf = Map.get(data_acc.yamux_stream_buffers, id, <<>>)
+
+                    %{
+                      data_acc
+                      | yamux_stream_buffers:
+                          Map.put(data_acc.yamux_stream_buffers, id, old_buf <> bytes)
+                    }
+                end
+            end
+
+          {:stream_closed, id} ->
+            send_to_owner_or_handler(data_acc, id, {:libp2p, :stream_closed, self(), id})
+            data_acc
+
+          {:stream_reset, id} ->
+            send_to_owner_or_handler(data_acc, id, {:libp2p, :stream_closed, self(), id})
+            data_acc
 
           _ ->
-            if acc.handler != nil,
-              do: send(acc.handler, {:libp2p, :stream_closed, self(), id, acc.remote_peer_id})
+            data_acc
         end
+      end)
 
-        %{acc | yamux_stream_owners: Map.delete(acc.yamux_stream_owners, id)}
-
-      {:stream_reset, id}, acc ->
-        case Map.get(acc.yamux_stream_owners, id) do
-          owner when is_pid(owner) ->
-            send(owner, {:libp2p, :stream_closed, self(), id})
-
-          _ ->
-            :ok
-        end
-
-        %{acc | yamux_stream_owners: Map.delete(acc.yamux_stream_owners, id)}
-
-      {:go_away, _code}, acc ->
-        acc
-    end)
+    {:ok, data}
   end
 
-  defp send_transport(st, plaintext) when is_binary(plaintext) do
-    {ct, cs_out} = Noise.transport_encrypt(st.noise_out, plaintext, <<>>)
+  defp send_to_owner_or_handler(data, id, msg) do
+    case Map.get(data.yamux_stream_owners, id) do
+      owner when is_pid(owner) ->
+        send(owner, msg)
 
-    case :gen_tcp.send(st.sock, Noise.frame(ct)) do
-      :ok ->
-        %{st | noise_out: cs_out}
-
-      {:error, _reason} ->
-        st
+      _ ->
+        if data.handler != nil do
+          # Map to handler's expected format if needed
+          send(data.handler, put_elem(msg, tuple_size(msg) - 1, data.remote_peer_id))
+        end
     end
   end
 
-  defp derive_remote_peer_id!(st) do
-    case st.noise.remote_identity_key do
+  defp send_transport(data, plaintext) do
+    {ct, cs_out} = Noise.transport_encrypt(data.noise_out, plaintext, <<>>)
+
+    case :gen_tcp.send(data.sock, Noise.frame(ct)) do
+      :ok -> %{data | noise_out: cs_out}
+      {:error, _} -> data
+    end
+  end
+
+  defp derive_remote_peer_id!(data) do
+    case data.noise.remote_identity_key do
       {:secp256k1, pub33} ->
         peer_id = PeerId.from_secp256k1_pubkey_compressed(pub33)
         PeerId.to_base58(peer_id)
 
-      # In some cases it might be a raw binary or a different tuple
       pub when is_binary(pub) ->
         peer_id = PeerId.from_secp256k1_pubkey_compressed(pub)
         PeerId.to_base58(peer_id)
 
       other ->
-        Logger.error("unsupported remote identity key #{inspect(other)}")
-        raise ArgumentError, "unsupported remote identity key"
+        raise ArgumentError, "unsupported remote identity key #{inspect(other)}"
     end
   end
 
-  defp notify_waiters(st) do
-    Enum.each(st.ready_waiters, fn from -> GenServer.reply(from, :ok) end)
-    %{st | ready_waiters: []}
+  defp cleanup_and_stop(data, reason) do
+    Enum.each(data.yamux_stream_owners, fn {id, owner} ->
+      send(owner, {:libp2p, :stream_closed, self(), id})
+    end)
+
+    if is_binary(data.remote_peer_id),
+      do: Registry.unregister(Libp2p.PeerRegistry, data.remote_peer_id)
+
+    {:stop, reason}
   end
 end

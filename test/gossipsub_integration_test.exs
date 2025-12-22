@@ -4,6 +4,12 @@ defmodule Libp2p.GossipsubIntegrationTest do
   alias Libp2p.{Gossipsub, Identity, PeerStore, Protocol, Swarm}
   alias Libp2p.Transport.Tcp
 
+  setup do
+    _ = Registry.start_link(keys: :unique, name: Libp2p.PeerRegistry)
+    _ = Task.Supervisor.start_link(name: Libp2p.RpcStreamSupervisor)
+    :ok
+  end
+
   test "gossipsub can subscribe and propagate a message between two swarms" do
     topic = "/test/1"
     payload = "hello"
@@ -42,7 +48,9 @@ defmodule Libp2p.GossipsubIntegrationTest do
         connection_supervisor: cs_a,
         gossipsub: gsp_a,
         protocol_handlers: %{
-          Protocol.gossipsub_1_1() => fn conn, sid, initial -> Gossipsub.handle_inbound(gsp_a, conn, sid, initial) end
+          Protocol.gossipsub_1_1() => fn conn, sid, initial ->
+            Gossipsub.handle_inbound(gsp_a, conn, sid, initial)
+          end
         }
       )
 
@@ -57,7 +65,9 @@ defmodule Libp2p.GossipsubIntegrationTest do
         connection_supervisor: cs_b,
         gossipsub: gsp_b,
         protocol_handlers: %{
-          Protocol.gossipsub_1_1() => fn conn, sid, initial -> Gossipsub.handle_inbound(gsp_b, conn, sid, initial) end
+          Protocol.gossipsub_1_1() => fn conn, sid, initial ->
+            Gossipsub.handle_inbound(gsp_b, conn, sid, initial)
+          end
         }
       )
 
@@ -68,6 +78,7 @@ defmodule Libp2p.GossipsubIntegrationTest do
     assert :ok = Libp2p.Connection.await_ready(conn_pid, 10_000)
     {:ok, peer_a} = Libp2p.Connection.remote_peer_id(conn_pid)
     :ok = Gossipsub.peer_connected(gsp_b, peer_a, conn_pid)
+
     case Gossipsub.await_peer(gsp_b, peer_a, 10_000) do
       :ok -> :ok
       other -> flunk("await_peer failed: #{inspect(other)}")

@@ -2,7 +2,7 @@ defmodule Libp2p.RequestResponse.Framing do
   @moduledoc """
   Simple length-delimited framing for request/response messages.
 
-  This is *not* Ethereum SSZ-snappy framing; callers can wrap with their own codec.
+  This is a generic libp2p framing implementation; callers can wrap with their own codec.
   We provide it as a default for integration tests and simple protocols.
   """
 

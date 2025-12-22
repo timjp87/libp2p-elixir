@@ -23,7 +23,16 @@ defmodule Libp2p.Identify do
   - **protocols**: A list of protocol IDs supported by the peer.
   """
 
-  alias Libp2p.{ConnectionV2, IdentifyPB, Multiaddr, MultistreamSelect, PeerInfo, PeerStore, Protocol}
+  alias Libp2p.{
+    ConnectionV2,
+    IdentifyPB,
+    Multiaddr,
+    MultistreamSelect,
+    PeerInfo,
+    PeerStore,
+    Protocol
+  }
+
   alias Libp2p.Crypto.PublicKeyPB
   alias Libp2p.Gossipsub.Framing
 
@@ -75,16 +84,35 @@ defmodule Libp2p.Identify do
   @spec request(pid(), pid() | atom(), keyword()) :: :ok | {:error, term()}
   def request(conn, peer_store, opts \\ []) do
     timeout = Keyword.get(opts, :timeout, 20_000)
+
+    Task.Supervisor.async(Libp2p.RpcStreamSupervisor, fn ->
+      do_request(conn, peer_store, timeout)
+    end)
+    |> Task.await(timeout + 5000)
+  rescue
+    _ -> {:error, :request_failed}
+  end
+
+  defp do_request(conn, peer_store, timeout) do
     # Eager MSS: send header + proposal in one go
     st = MultistreamSelect.new_initiator([Protocol.identify()])
     {out0, st} = MultistreamSelect.start(st)
 
-    with {:ok, stream_id} <- ConnectionV2.open_stream(conn, out0),
-         {:ok, leftover} <- negotiate(conn, stream_id, st, timeout),
-         {:ok, msg_bytes} <- recv_one(conn, stream_id, leftover, timeout) do
-      msg = IdentifyPB.decode(msg_bytes)
-      _ = ConnectionV2.close_stream(conn, stream_id)
-      update_peer_store(conn, peer_store, msg)
+    try do
+      with {:ok, stream_id} <- ConnectionV2.open_stream(conn, out0),
+           :ok <- ConnectionV2.set_stream_handler(conn, stream_id, self()),
+           {:ok, leftover} <- negotiate(conn, stream_id, st, timeout),
+           {:ok, msg_bytes} <- recv_one(conn, stream_id, leftover, timeout) do
+        msg = IdentifyPB.decode(msg_bytes)
+        _ = ConnectionV2.close_stream(conn, stream_id)
+        update_peer_store(conn, peer_store, msg)
+      else
+        {:error, reason} -> {:error, reason}
+        other -> {:error, other}
+      end
+    catch
+      :exit, _reason ->
+        {:error, :connection_closed}
     end
   end
 
@@ -95,7 +123,9 @@ defmodule Libp2p.Identify do
         if out != <<>>, do: :ok = ConnectionV2.send_stream(conn, stream_id, out)
 
         case Enum.find(events, fn e -> match?({:error, _}, e) end) do
-          {:error, reason} -> {:error, {:negotiation_failed, reason}}
+          {:error, reason} ->
+            {:error, {:negotiation_failed, reason}}
+
           _ ->
             case Enum.find(events, fn e -> match?({:selected, _}, e) end) do
               {:selected, _} -> {:ok, Map.get(st2, :buf, <<>>)}

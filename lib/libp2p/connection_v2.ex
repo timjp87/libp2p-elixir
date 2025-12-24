@@ -277,6 +277,8 @@ defmodule Libp2p.ConnectionV2 do
 
     case drive_noise_transport(data) do
       {:ok, data} -> {:keep_state, data}
+      {:next_state, state, data2} -> {:next_state, state, data2}
+      {:next_state, state, data2, actions} -> {:next_state, state, data2, actions}
       {:error, reason} -> {:stop, {:shutdown, reason}}
     end
   end
@@ -287,6 +289,8 @@ defmodule Libp2p.ConnectionV2 do
 
     case drive_noise_transport(data) do
       {:ok, data} -> {:keep_state, data}
+      {:next_state, state, data2} -> {:next_state, state, data2}
+      {:next_state, state, data2, actions} -> {:next_state, state, data2, actions}
       {:error, reason} -> {:stop, {:shutdown, reason}}
     end
   end

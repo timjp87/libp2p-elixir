@@ -17,7 +17,7 @@ Add `libp2p_elixir` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:libp2p_elixir, "~> 0.9.2"}
+    {:libp2p_elixir, "~> 0.9.3"}
   ]
 end
 ```

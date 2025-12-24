@@ -107,12 +107,17 @@ defmodule Libp2p.Swarm do
     # V2 handles socket creation internally for initiators.
     case start_connection(st, :outbound, {ip, port}) do
       {:ok, pid} ->
-        case Libp2p.ConnectionV2.await_ready(pid, ready_timeout) do
-          :ok ->
-            {:reply, {:ok, pid}, st}
+        res =
+          try do
+            Libp2p.ConnectionV2.await_ready(pid, ready_timeout)
+          catch
+            :exit, :normal -> {:error, :closed}
+            :exit, reason -> {:error, reason}
+          end
 
-          {:error, reason} ->
-            {:reply, {:error, reason}, st}
+        case res do
+          :ok -> {:reply, {:ok, pid}, st}
+          {:error, reason} -> {:reply, {:error, reason}, st}
         end
 
       {:error, reason} ->

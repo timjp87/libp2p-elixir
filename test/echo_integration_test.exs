@@ -90,5 +90,3 @@ defmodule Libp2p.EchoIntegrationTest do
     :ok = Libp2p.ConnectionV2.close_stream(conn_pid, stream_id)
   end
 end
-
-

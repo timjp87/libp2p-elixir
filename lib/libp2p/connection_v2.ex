@@ -44,7 +44,7 @@ defmodule Libp2p.ConnectionV2 do
 
   require Logger
 
-  alias Libp2p.{Identity, MultistreamSelect, Noise, PeerId, PeerSession}
+  alias Libp2p.{Identity, MultistreamSelect, Noise, PeerId}
   alias Libp2p.Yamux.Session, as: Yamux
 
   @sec_proposals ["/noise"]
@@ -511,8 +511,6 @@ defmodule Libp2p.ConnectionV2 do
       {:stop, {:shutdown, {:peer_id_mismatch, data.expected_peer_id, remote_peer_id}}}
     else
       data = %{data | remote_peer_id: remote_peer_id}
-      # Start PeerSession if not already present
-      _ = PeerSession.register_connection(remote_peer_id, self())
 
       case Map.get(data.noise, :selected_stream_muxer, nil) do
         "/yamux/1.0.0" ->
@@ -530,9 +528,6 @@ defmodule Libp2p.ConnectionV2 do
 
   defp enter_yamux(data) do
     y = Yamux.new(if(data.role == :initiator, do: :client, else: :server))
-
-    if Process.whereis(Libp2p.PeerRegistry),
-      do: Registry.register(Libp2p.PeerRegistry, data.remote_peer_id, nil)
 
     data = %{data | yamux: y, mux_mss_state: nil}
     notify_ready(data)
@@ -591,9 +586,6 @@ defmodule Libp2p.ConnectionV2 do
         # Transition to yamux state, processing leftovers
         y = Yamux.new(if(data.role == :initiator, do: :client, else: :server))
         leftover = Map.get(mss2, :buf, <<>>)
-
-        if Process.whereis(Libp2p.PeerRegistry),
-          do: Registry.register(Libp2p.PeerRegistry, data.remote_peer_id, nil)
 
         data = %{data | yamux: y, mux_mss_state: nil}
         notify_ready(data)
@@ -708,9 +700,6 @@ defmodule Libp2p.ConnectionV2 do
     Enum.each(data.yamux_stream_owners, fn {id, owner} ->
       send(owner, {:libp2p, :stream_closed, self(), id})
     end)
-
-    if is_binary(data.remote_peer_id),
-      do: Registry.unregister(Libp2p.PeerRegistry, data.remote_peer_id)
 
     {:stop, reason}
   end

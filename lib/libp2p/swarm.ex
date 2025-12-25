@@ -71,7 +71,11 @@ defmodule Libp2p.Swarm do
       connections: MapSet.new(),
       streams: %{},
       protocol_handlers: Keyword.get(opts, :protocol_handlers, %{}),
-      gossipsub: Keyword.get(opts, :gossipsub, nil)
+      gossipsub: Keyword.get(opts, :gossipsub, nil),
+      # Optional extra process to notify when a connection becomes ready (yamux).
+      # This is used by downstream apps (e.g. Panacea) to kick off Status handshakes
+      # without having to make the Swarm the handler/owner.
+      notify_ready: Keyword.get(opts, :notify_ready, nil)
     }
 
     {:ok, st}
@@ -90,7 +94,8 @@ defmodule Libp2p.Swarm do
               listener: listener,
               connection_supervisor: st.connection_supervisor,
               identity: st.identity,
-              peer_store: st.peer_store
+              peer_store: st.peer_store,
+              notify_ready: st.notify_ready
             })
           end)
 
@@ -103,22 +108,31 @@ defmodule Libp2p.Swarm do
     end
   end
 
-  def handle_call({:dial, ip, port, ready_timeout}, _from, st) do
+  def handle_call({:dial, ip, port, ready_timeout}, from, st) do
     # V2 handles socket creation internally for initiators.
     case start_connection(st, :outbound, {ip, port}) do
       {:ok, pid} ->
-        res =
-          try do
-            Libp2p.ConnectionV2.await_ready(pid, ready_timeout)
-          catch
-            :exit, :normal -> {:error, :closed}
-            :exit, reason -> {:error, reason}
-          end
+        # Don't block the Swarm process on await_ready. We let the Swarm keep
+        # handling other dials and inbound streams, and reply async from a task.
+        Task.start(fn ->
+          res =
+            try do
+              Libp2p.ConnectionV2.await_ready(pid, ready_timeout)
+            catch
+              :exit, :normal -> {:error, :closed}
+              :exit, reason -> {:error, reason}
+            end
 
-        case res do
-          :ok -> {:reply, {:ok, pid}, st}
-          {:error, reason} -> {:reply, {:error, reason}, st}
-        end
+          reply =
+            case res do
+              :ok -> {:ok, pid}
+              {:error, reason} -> {:error, reason}
+            end
+
+          GenServer.reply(from, reply)
+        end)
+
+        {:noreply, st}
 
       {:error, reason} ->
         {:reply, {:error, reason}, st}
@@ -133,13 +147,29 @@ defmodule Libp2p.Swarm do
     {:ok, pid} =
       Task.Supervisor.start_child(Libp2p.RpcStreamSupervisor, fn ->
         # Take ownership directly to bypass Swarm for future data
-        Libp2p.ConnectionV2.set_stream_handler(conn, stream_id, self())
+        try do
+          Libp2p.ConnectionV2.set_stream_handler(conn, stream_id, self())
+        catch
+          :exit, _ -> :ok
+        end
 
-        case StreamNegotiator.negotiate_inbound(conn, stream_id, supported) do
+        negotiate_res =
+          try do
+            StreamNegotiator.negotiate_inbound(conn, stream_id, supported)
+          catch
+            :exit, reason -> {:error, {:exit, reason}}
+          end
+
+        case negotiate_res do
           {:ok, proto, initial} ->
             case Map.get(st.protocol_handlers, proto) do
               nil ->
-                _ = Libp2p.ConnectionV2.close_stream(conn, stream_id)
+                try do
+                  _ = Libp2p.ConnectionV2.close_stream(conn, stream_id)
+                catch
+                  :exit, _ -> :ok
+                end
+
                 :ok
 
               handler when is_function(handler, 3) ->
@@ -158,14 +188,23 @@ defmodule Libp2p.Swarm do
                       handler_mod.handle_inbound(conn, stream_id, initial)
 
                     true ->
-                      _ = Libp2p.ConnectionV2.close_stream(conn, stream_id)
+                      try do
+                        _ = Libp2p.ConnectionV2.close_stream(conn, stream_id)
+                      catch
+                        :exit, _ -> :ok
+                      end
+
                       :error
                   end
 
                 case res do
                   {:ok, pid} when is_pid(pid) ->
                     # Transfer ownership to the new handler process
-                    Libp2p.ConnectionV2.set_stream_handler(conn, stream_id, pid)
+                    try do
+                      Libp2p.ConnectionV2.set_stream_handler(conn, stream_id, pid)
+                    catch
+                      :exit, _ -> :ok
+                    end
 
                   _ ->
                     :ok
@@ -173,7 +212,11 @@ defmodule Libp2p.Swarm do
             end
 
           {:error, _} ->
-            _ = Libp2p.ConnectionV2.close_stream(conn, stream_id)
+            try do
+              _ = Libp2p.ConnectionV2.close_stream(conn, stream_id)
+            catch
+              :exit, _ -> :ok
+            end
             :ok
         end
       end)
@@ -247,6 +290,8 @@ defmodule Libp2p.Swarm do
          handler: ctx.swarm,
          # notify Swarm when connection ready
          notify_conn_ready?: true,
+         # also notify external consumer if configured
+         notify_ready: Map.get(ctx, :notify_ready, nil),
          noise_prologue: "",
          # default compatibility
          noise_hash_protocol_name?: false
@@ -282,6 +327,7 @@ defmodule Libp2p.Swarm do
          # Swarm
          handler: self(),
          notify_conn_ready?: true,
+         notify_ready: st.notify_ready,
          noise_prologue: "",
          dial_timeout_ms: 5_000
        ]}

@@ -172,16 +172,37 @@ defmodule Libp2p.Yamux.Session do
         s = Map.get(st.streams, id, %{})
         st = %{st | streams: Map.put(st.streams, id, Map.put(s, :acked, true))}
         # ACK may be combined with a DATA frame (including payload and/or FIN).
-        events = if f.data != <<>>, do: [{:stream_data, id, f.data} | events], else: events
+        {events, out} = maybe_emit_stream_data_and_window_update(events, out, id, f.data)
         st2 = maybe_handle_fin(st, id, flags)
         events = if band(flags, @fin) != 0, do: [{:stream_close, id} | events], else: events
         {events, out, st2}
 
       true ->
-        events = if f.data != <<>>, do: [{:stream_data, id, f.data} | events], else: events
+        {events, out} = maybe_emit_stream_data_and_window_update(events, out, id, f.data)
         st2 = maybe_handle_fin(st, id, flags)
         events = if band(flags, @fin) != 0, do: [{:stream_close, id} | events], else: events
         {events, out, st2}
+    end
+  end
+
+  # Yamux flow control:
+  #
+  # Many production implementations enforce a per-stream send window (commonly 256KB initial).
+  # This session historically did not send `WINDOW_UPDATE` frames at all, which caused peers
+  # to stop sending mid-response once the window was exhausted (manifesting as truncated
+  # `ssz_snappy` payloads and decode errors).
+  #
+  # Simplest correct-enough approach: immediately credit back exactly what we receive.
+  # This treats inbound bytes as "consumed" as soon as we deliver them to the application.
+  defp maybe_emit_stream_data_and_window_update(events, out, stream_id, data)
+       when is_integer(stream_id) and is_binary(data) do
+    if data == <<>> do
+      {events, out}
+    else
+      n = byte_size(data)
+      # WindowUpdate: `length` is an in-header value (u32) representing additional credit.
+      wu = %Frame{type: :window_update, flags: 0, stream_id: stream_id, length: n}
+      {[{:stream_data, stream_id, data} | events], [Frame.encode(wu) | out]}
     end
   end
 

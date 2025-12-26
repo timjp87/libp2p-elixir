@@ -162,38 +162,57 @@ defmodule Libp2p.Identify do
     local_identity = get_local_identity(conn)
     public_key = PublicKeyPB.encode_public_key(:secp256k1, local_identity.pubkey_compressed)
 
+    protocols =
+      try do
+        :gen_statem.call(conn, :supported_protocols, 1_000)
+      catch
+        :exit, _ -> []
+      end
+
     %{
       protocol_version: @default_protocol_version,
       agent_version: @default_agent_version,
       public_key: public_key,
       listen_addrs: [],
       observed_addr: nil,
-      protocols: []
+      protocols: protocols
     }
   end
 
   defp update_peer_store(conn, peer_store, msg) do
-    {:ok, remote_peer_id} = ConnectionV2.remote_peer_id(conn)
+    remote_peer_id =
+      case ConnectionV2.remote_peer_id(conn) do
+        {:ok, pid} -> pid
+        {:error, _reason} -> nil
+      end
 
-    addrs = Enum.map(msg.listen_addrs, &Multiaddr.from_bytes/1)
-    observed = if msg.observed_addr, do: Multiaddr.from_bytes(msg.observed_addr)
+    if is_nil(remote_peer_id) do
+      :ok
+    else
 
-    info = %PeerInfo{
-      peer_id: remote_peer_id,
-      addrs: addrs,
-      protocols: MapSet.new(msg.protocols || []),
-      agent_version: msg.agent_version,
-      protocol_version: msg.protocol_version,
-      observed_addr: observed,
-      last_seen_ms: System.system_time(:millisecond)
-    }
+      addrs = Enum.map(msg.listen_addrs, &Multiaddr.from_bytes/1)
+      observed = if msg.observed_addr, do: Multiaddr.from_bytes(msg.observed_addr)
 
-    PeerStore.upsert(peer_store, info)
+      info = %PeerInfo{
+        peer_id: remote_peer_id,
+        addrs: addrs,
+        protocols: MapSet.new(msg.protocols || []),
+        agent_version: msg.agent_version,
+        protocol_version: msg.protocol_version,
+        observed_addr: observed,
+        last_seen_ms: System.system_time(:millisecond)
+      }
+
+      PeerStore.upsert(peer_store, info)
+    end
   end
 
   defp get_local_identity(conn) do
-    GenServer.call(conn, :__local_identity__)
-  rescue
-    _ -> %Libp2p.Identity{}
+    # ConnectionV2 is a :gen_statem; use :gen_statem.call and tolerate dead conns.
+    try do
+      :gen_statem.call(conn, :__local_identity__, 5_000)
+    catch
+      :exit, _ -> %Libp2p.Identity{}
+    end
   end
 end

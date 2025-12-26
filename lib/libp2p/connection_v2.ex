@@ -60,7 +60,13 @@ defmodule Libp2p.ConnectionV2 do
   end
 
   @spec remote_peer_id(pid()) :: {:ok, binary()} | {:error, term()}
-  def remote_peer_id(conn), do: :gen_statem.call(conn, :remote_peer_id)
+  def remote_peer_id(conn) do
+    try do
+      :gen_statem.call(conn, :remote_peer_id)
+    catch
+      :exit, reason -> {:error, reason}
+    end
+  end
 
   @spec await_ready(pid(), timeout()) :: :ok | {:error, term()}
   def await_ready(conn, timeout \\ 20_000) do
@@ -77,11 +83,18 @@ defmodule Libp2p.ConnectionV2 do
   @spec send_stream(pid(), non_neg_integer(), binary()) :: :ok | {:error, term()}
   def send_stream(conn, stream_id, data)
       when is_pid(conn) and is_integer(stream_id) and is_binary(data),
-      do: :gen_statem.call(conn, {:send_stream, stream_id, data})
+      do: :gen_statem.call(conn, {:send_stream, stream_id, data}, 20_000)
 
   @spec close_stream(pid(), non_neg_integer()) :: :ok | {:error, term()}
-  def close_stream(conn, stream_id) when is_pid(conn) and is_integer(stream_id),
-    do: :gen_statem.call(conn, {:close_stream, stream_id})
+  def close_stream(conn, stream_id) when is_pid(conn) and is_integer(stream_id) do
+    try do
+      :gen_statem.call(conn, {:close_stream, stream_id}, 5_000)
+    catch
+      :exit, {:noproc, _} -> :ok
+      :exit, :noproc -> :ok
+      :exit, reason -> {:error, {:exit, reason}}
+    end
+  end
 
   @spec peer_store(pid()) :: pid() | atom()
   def peer_store(conn), do: :gen_statem.call(conn, :peer_store)
@@ -110,6 +123,7 @@ defmodule Libp2p.ConnectionV2 do
     expected_peer_id = Keyword.get(opts, :expected_peer_id, nil)
     enforce_expected_peer_id? = Keyword.get(opts, :enforce_expected_peer_id?, true)
     peer_store = Keyword.get(opts, :peer_store, Libp2p.PeerStore)
+    supported_protocols = Keyword.get(opts, :supported_protocols, [])
 
     dial_timeout_ms = Keyword.get(opts, :dial_timeout_ms, 3_000)
     noise_prologue = Keyword.get(opts, :noise_prologue, <<>>)
@@ -166,6 +180,7 @@ defmodule Libp2p.ConnectionV2 do
       enforce_expected_peer_id?: enforce_expected_peer_id?,
       remote_peer_id: nil,
       peer_store: peer_store,
+      supported_protocols: supported_protocols,
       notify_ready: Keyword.get(opts, :notify_ready),
       mss_state: mss,
       dial_timeout_ms: dial_timeout_ms,
@@ -191,7 +206,13 @@ defmodule Libp2p.ConnectionV2 do
       {:ok, :connecting, data, [{:next_event, :internal, :connect}]}
     else
       {out, mss} = MultistreamSelect.start(data.mss_state)
-      if out != <<>>, do: :ok = :gen_tcp.send(sock, out)
+      if out != <<>> do
+        case :gen_tcp.send(sock, out) do
+          :ok -> :ok
+          {:error, reason} -> {:stop, {:shutdown, {:tcp_send_failed, reason}}}
+        end
+      end
+
       {:ok, :mss_security, %{data | mss_state: mss}}
     end
   end
@@ -213,7 +234,13 @@ defmodule Libp2p.ConnectionV2 do
          ) do
       {:ok, sock} ->
         {out, mss} = MultistreamSelect.start(data.mss_state)
-        if out != <<>>, do: :ok = :gen_tcp.send(sock, out)
+        if out != <<>> do
+          case :gen_tcp.send(sock, out) do
+            :ok -> :ok
+            {:error, reason} -> {:stop, {:shutdown, {:tcp_send_failed, {ip, port}, reason}}}
+          end
+        end
+
         {:next_state, :mss_security, %{data | sock: sock, mss_state: mss}}
 
       {:error, reason} ->
@@ -330,6 +357,11 @@ defmodule Libp2p.ConnectionV2 do
   @impl :gen_statem
   def handle_event({:call, from}, :__local_identity__, _state, data) do
     {:keep_state, data, [{:reply, from, data.identity}]}
+  end
+
+  @impl :gen_statem
+  def handle_event({:call, from}, :supported_protocols, _state, data) do
+    {:keep_state, data, [{:reply, from, data.supported_protocols || []}]}
   end
 
   @impl :gen_statem

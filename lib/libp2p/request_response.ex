@@ -94,12 +94,22 @@ defmodule Libp2p.RequestResponse do
         # Framing is handled here by the task
         case recv_one(conn, stream_id, codec, 20_000, initial) do
           {:ok, req_bytes} ->
-            {:ok, peer_id} = ConnectionV2.remote_peer_id(conn)
-            resp = handler.(peer_id, req_bytes)
-            encoded_resp = encode(codec, resp)
-            _ = ConnectionV2.send_stream(conn, stream_id, encoded_resp)
-            _ = ConnectionV2.close_stream(conn, stream_id)
-            :ok
+            peer_id =
+              case ConnectionV2.remote_peer_id(conn) do
+                {:ok, pid} -> pid
+                {:error, _} -> nil
+              end
+
+            if is_nil(peer_id) do
+              _ = ConnectionV2.reset_stream(conn, stream_id)
+              :ok
+            else
+              resp = handler.(peer_id, req_bytes)
+              encoded_resp = encode(codec, resp)
+              _ = ConnectionV2.send_stream(conn, stream_id, encoded_resp)
+              _ = ConnectionV2.close_stream(conn, stream_id)
+              :ok
+            end
 
           {:error, _reason} ->
             _ = ConnectionV2.reset_stream(conn, stream_id)

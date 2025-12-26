@@ -95,7 +95,8 @@ defmodule Libp2p.Swarm do
               connection_supervisor: st.connection_supervisor,
               identity: st.identity,
               peer_store: st.peer_store,
-              notify_ready: st.notify_ready
+          notify_ready: st.notify_ready,
+          protocol_handlers: st.protocol_handlers
             })
           end)
 
@@ -279,6 +280,8 @@ defmodule Libp2p.Swarm do
   end
 
   defp start_inbound_connection(ctx, sock) do
+    supported_protocols = Map.keys(ctx.protocol_handlers || %{})
+
     child_spec =
       {Libp2p.ConnectionV2,
        [
@@ -286,6 +289,7 @@ defmodule Libp2p.Swarm do
          socket: sock,
          identity: ctx.identity,
          peer_store: ctx.peer_store,
+         supported_protocols: supported_protocols,
          # notify Swarm on stream events
          handler: ctx.swarm,
          # notify Swarm when connection ready
@@ -317,6 +321,8 @@ defmodule Libp2p.Swarm do
   end
 
   defp start_connection(st, :outbound, {ip, port}) do
+    supported_protocols = Map.keys(st.protocol_handlers || %{})
+
     child_spec =
       {Libp2p.ConnectionV2,
        [
@@ -324,6 +330,7 @@ defmodule Libp2p.Swarm do
          dial: {ip, port},
          identity: st.identity,
          peer_store: st.peer_store,
+         supported_protocols: supported_protocols,
          # Swarm
          handler: self(),
          notify_conn_ready?: true,

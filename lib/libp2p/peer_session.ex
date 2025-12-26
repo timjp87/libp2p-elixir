@@ -75,9 +75,9 @@ defmodule Libp2p.PeerSession do
       connections = MapSet.delete(st.connections, pid)
 
       if MapSet.size(connections) == 0 do
-        # Should we stop the session if no connections are left?
-        # Typically yes, but we might want to keep it briefly for "idle" state
-        # as suggested in the architecture plan.
+        # Keep the session alive even if all connections are gone; higher layers may want
+        # to retain per-peer metadata/score state. Connection liveness is accounted for by
+        # checking the `connections` set when needed.
         {:noreply, %{st | connections: connections}}
       else
         {:noreply, %{st | connections: connections}}

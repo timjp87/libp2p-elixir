@@ -58,7 +58,7 @@ defmodule Libp2p.Identify do
           {:ok, msg_bytes} ->
             msg = IdentifyPB.decode(msg_bytes)
             _ = ConnectionV2.close_stream(conn, stream_id)
-            _ = update_peer_store(conn, peer_store, msg)
+            _ = upsert_peer_info(conn, peer_store, msg)
             :ok
 
           {:error, reason} ->
@@ -81,7 +81,7 @@ defmodule Libp2p.Identify do
   @doc """
   Perform an outbound identify request.
   """
-  @spec request(pid(), pid() | atom(), keyword()) :: :ok | {:error, term()}
+  @spec request(pid(), pid() | atom(), keyword()) :: {:ok, PeerInfo.t()} | {:error, term()}
   def request(conn, peer_store, opts \\ []) do
     timeout = Keyword.get(opts, :timeout, 20_000)
 
@@ -99,13 +99,13 @@ defmodule Libp2p.Identify do
     {out0, st} = MultistreamSelect.start(st)
 
     try do
-      with {:ok, stream_id} <- ConnectionV2.open_stream(conn, out0),
+      with {:ok, stream_id} <- open_negotiation_stream(conn, out0),
            :ok <- ConnectionV2.set_stream_handler(conn, stream_id, self()),
            {:ok, leftover} <- negotiate(conn, stream_id, st, timeout),
            {:ok, msg_bytes} <- recv_one(conn, stream_id, leftover, timeout) do
         msg = IdentifyPB.decode(msg_bytes)
         _ = ConnectionV2.close_stream(conn, stream_id)
-        update_peer_store(conn, peer_store, msg)
+        upsert_peer_info(conn, peer_store, msg)
       else
         {:error, reason} -> {:error, reason}
         other -> {:error, other}
@@ -113,6 +113,18 @@ defmodule Libp2p.Identify do
     catch
       :exit, _reason ->
         {:error, :connection_closed}
+    end
+  end
+
+  @doc false
+  @spec open_negotiation_stream(pid(), binary(), module()) ::
+          {:ok, non_neg_integer()} | {:error, term()}
+  def open_negotiation_stream(conn, out0, conn_mod \\ ConnectionV2)
+      when is_pid(conn) and is_binary(out0) do
+    if out0 == <<>> do
+      conn_mod.open_stream(conn)
+    else
+      conn_mod.open_stream(conn, out0)
     end
   end
 
@@ -179,31 +191,27 @@ defmodule Libp2p.Identify do
     }
   end
 
-  defp update_peer_store(conn, peer_store, msg) do
-    remote_peer_id =
-      case ConnectionV2.remote_peer_id(conn) do
-        {:ok, pid} -> pid
-        {:error, _reason} -> nil
-      end
+  defp upsert_peer_info(conn, peer_store, msg) do
+    case ConnectionV2.remote_peer_id(conn) do
+      {:ok, remote_peer_id} ->
+        addrs = Enum.map(msg.listen_addrs, &Multiaddr.from_bytes/1)
+        observed = if msg.observed_addr, do: Multiaddr.from_bytes(msg.observed_addr)
 
-    if is_nil(remote_peer_id) do
-      :ok
-    else
+        info = %PeerInfo{
+          peer_id: remote_peer_id,
+          addrs: addrs,
+          protocols: MapSet.new(msg.protocols || []),
+          agent_version: msg.agent_version,
+          protocol_version: msg.protocol_version,
+          observed_addr: observed,
+          last_seen_ms: System.system_time(:millisecond)
+        }
 
-      addrs = Enum.map(msg.listen_addrs, &Multiaddr.from_bytes/1)
-      observed = if msg.observed_addr, do: Multiaddr.from_bytes(msg.observed_addr)
+        :ok = PeerStore.upsert(peer_store, info)
+        {:ok, info}
 
-      info = %PeerInfo{
-        peer_id: remote_peer_id,
-        addrs: addrs,
-        protocols: MapSet.new(msg.protocols || []),
-        agent_version: msg.agent_version,
-        protocol_version: msg.protocol_version,
-        observed_addr: observed,
-        last_seen_ms: System.system_time(:millisecond)
-      }
-
-      PeerStore.upsert(peer_store, info)
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

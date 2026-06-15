@@ -20,6 +20,9 @@ defmodule Libp2p.Protocol do
   @spec identify_push() :: binary()
   def identify_push, do: "/ipfs/id/push/1.0.0"
 
+  @spec ping() :: binary()
+  def ping, do: "/ipfs/ping/1.0.0"
+
   @spec gossipsub_1_1() :: binary()
   def gossipsub_1_1, do: "/meshsub/1.1.0"
 end

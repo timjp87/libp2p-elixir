@@ -14,7 +14,7 @@ defmodule Libp2p.Swarm do
   use GenServer
   require Logger
 
-  alias Libp2p.StreamNegotiator
+  alias Libp2p.{Protocol, StreamNegotiator}
   alias Libp2p.Transport.Tcp
 
   @type t :: pid() | atom()
@@ -62,6 +62,12 @@ defmodule Libp2p.Swarm do
     conn_sup = Keyword.fetch!(opts, :connection_supervisor)
     peer_session_sup = Keyword.get(opts, :peer_session_supervisor)
 
+    protocol_handlers =
+      opts
+      |> Keyword.get(:protocol_handlers, %{})
+      |> Map.new()
+      |> Map.put_new(Protocol.ping(), Libp2p.Ping)
+
     st = %{
       identity: identity,
       peer_store: peer_store,
@@ -70,7 +76,7 @@ defmodule Libp2p.Swarm do
       listeners: %{},
       connections: MapSet.new(),
       streams: %{},
-      protocol_handlers: Keyword.get(opts, :protocol_handlers, %{}),
+      protocol_handlers: protocol_handlers,
       gossipsub: Keyword.get(opts, :gossipsub, nil),
       # Optional extra process to notify when a connection becomes ready (yamux).
       # This is used by downstream apps (e.g. Panacea) to kick off Status handshakes
@@ -95,8 +101,8 @@ defmodule Libp2p.Swarm do
               connection_supervisor: st.connection_supervisor,
               identity: st.identity,
               peer_store: st.peer_store,
-          notify_ready: st.notify_ready,
-          protocol_handlers: st.protocol_handlers
+              notify_ready: st.notify_ready,
+              protocol_handlers: st.protocol_handlers
             })
           end)
 
@@ -218,6 +224,7 @@ defmodule Libp2p.Swarm do
             catch
               :exit, _ -> :ok
             end
+
             :ok
         end
       end)

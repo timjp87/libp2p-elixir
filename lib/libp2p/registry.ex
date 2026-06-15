@@ -20,8 +20,14 @@ defmodule Libp2p.Registry do
     GenServer.cast(name, {:unregister, peer_id})
   end
 
+  @spec unregister(binary(), pid(), atom() | pid()) :: :ok
+  def unregister(peer_id, pid, name) when is_binary(peer_id) and is_pid(pid) do
+    GenServer.cast(name, {:unregister, peer_id, pid})
+  end
+
   @spec get(binary(), atom() | pid()) :: nil | pid()
-  def get(peer_id, name \\ __MODULE__) when is_binary(peer_id), do: GenServer.call(name, {:get, peer_id})
+  def get(peer_id, name \\ __MODULE__) when is_binary(peer_id),
+    do: GenServer.call(name, {:get, peer_id})
 
   @spec list(atom() | pid()) :: [{binary(), pid()}]
   def list(name \\ __MODULE__), do: GenServer.call(name, :list)
@@ -52,6 +58,16 @@ defmodule Libp2p.Registry do
 
   def handle_cast({:unregister, peer_id}, st) do
     {:noreply, %{st | conns: Map.delete(st.conns, peer_id)}}
+  end
+
+  def handle_cast({:unregister, peer_id, pid}, st) do
+    conns =
+      case Map.get(st.conns, peer_id) do
+        ^pid -> Map.delete(st.conns, peer_id)
+        _other -> st.conns
+      end
+
+    {:noreply, %{st | conns: conns}}
   end
 
   @impl true

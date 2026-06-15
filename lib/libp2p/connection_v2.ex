@@ -126,6 +126,7 @@ defmodule Libp2p.ConnectionV2 do
     supported_protocols = Keyword.get(opts, :supported_protocols, [])
 
     dial_timeout_ms = Keyword.get(opts, :dial_timeout_ms, 3_000)
+    upgrade_timeout_ms = Keyword.get(opts, :upgrade_timeout_ms, 20_000)
     noise_prologue = Keyword.get(opts, :noise_prologue, <<>>)
     noise_hash_protocol_name? = Keyword.get(opts, :noise_hash_protocol_name?, false)
     noise_hkdf_swap? = Keyword.get(opts, :noise_hkdf_swap?, false)
@@ -184,6 +185,8 @@ defmodule Libp2p.ConnectionV2 do
       notify_ready: Keyword.get(opts, :notify_ready),
       mss_state: mss,
       dial_timeout_ms: dial_timeout_ms,
+      upgrade_timeout_ms: upgrade_timeout_ms,
+      upgrade_timer: nil,
       buf: <<>>,
       noise: noise,
       noise_buf: <<>>,
@@ -206,6 +209,7 @@ defmodule Libp2p.ConnectionV2 do
       {:ok, :connecting, data, [{:next_event, :internal, :connect}]}
     else
       {out, mss} = MultistreamSelect.start(data.mss_state)
+
       if out != <<>> do
         case :gen_tcp.send(sock, out) do
           :ok -> :ok
@@ -213,7 +217,7 @@ defmodule Libp2p.ConnectionV2 do
         end
       end
 
-      {:ok, :mss_security, %{data | mss_state: mss}}
+      {:ok, :mss_security, %{data | mss_state: mss} |> start_upgrade_timer()}
     end
   end
 
@@ -234,6 +238,7 @@ defmodule Libp2p.ConnectionV2 do
          ) do
       {:ok, sock} ->
         {out, mss} = MultistreamSelect.start(data.mss_state)
+
         if out != <<>> do
           case :gen_tcp.send(sock, out) do
             :ok -> :ok
@@ -241,7 +246,12 @@ defmodule Libp2p.ConnectionV2 do
           end
         end
 
-        {:next_state, :mss_security, %{data | sock: sock, mss_state: mss}}
+        data =
+          data
+          |> Map.merge(%{sock: sock, mss_state: mss})
+          |> start_upgrade_timer()
+
+        {:next_state, :mss_security, data}
 
       {:error, reason} ->
         {:stop, {:shutdown, {:dial_failed, {ip, port}, reason}}}
@@ -341,6 +351,24 @@ defmodule Libp2p.ConnectionV2 do
   def handle_event(:info, :start_socket, _state, data) do
     :ok = :inet.setopts(data.sock, active: :once)
     {:keep_state, data, [{:next_event, :internal, :drive}]}
+  end
+
+  @impl :gen_statem
+  def handle_event(:info, :upgrade_timeout, :yamux, data) do
+    {:keep_state, %{data | upgrade_timer: nil}}
+  end
+
+  @impl :gen_statem
+  def handle_event(:info, :upgrade_timeout, state, data) do
+    Logger.debug(%{
+      event: "p2p_upgrade_timeout",
+      phase: state,
+      peer_addr: inspect(data.peer_addr),
+      role: data.role,
+      remote_peer_id: data.remote_peer_id
+    })
+
+    {:stop, {:shutdown, {:upgrade_timeout, state}}, %{data | upgrade_timer: nil}}
   end
 
   # Synchronous calls
@@ -565,7 +593,11 @@ defmodule Libp2p.ConnectionV2 do
   defp enter_yamux(data) do
     y = Yamux.new(if(data.role == :initiator, do: :client, else: :server))
 
-    data = %{data | yamux: y, mux_mss_state: nil}
+    data =
+      data
+      |> cancel_upgrade_timer()
+      |> Map.merge(%{yamux: y, mux_mss_state: nil})
+
     notify_ready(data)
     {:next_state, :yamux, data, [{:next_event, :internal, :drive}]}
   end
@@ -739,4 +771,25 @@ defmodule Libp2p.ConnectionV2 do
 
     {:stop, reason}
   end
+
+  defp start_upgrade_timer(%{upgrade_timeout_ms: timeout} = data)
+       when is_integer(timeout) and timeout > 0 do
+    %{data | upgrade_timer: Process.send_after(self(), :upgrade_timeout, timeout)}
+  end
+
+  defp start_upgrade_timer(data), do: data
+
+  defp cancel_upgrade_timer(%{upgrade_timer: timer} = data) when is_reference(timer) do
+    _ = Process.cancel_timer(timer)
+
+    receive do
+      :upgrade_timeout -> :ok
+    after
+      0 -> :ok
+    end
+
+    %{data | upgrade_timer: nil}
+  end
+
+  defp cancel_upgrade_timer(data), do: data
 end

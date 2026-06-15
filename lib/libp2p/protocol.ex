@@ -23,6 +23,12 @@ defmodule Libp2p.Protocol do
   @spec ping() :: binary()
   def ping, do: "/ipfs/ping/1.0.0"
 
+  @spec gossipsub_1_2() :: binary()
+  def gossipsub_1_2, do: "/meshsub/1.2.0"
+
   @spec gossipsub_1_1() :: binary()
   def gossipsub_1_1, do: "/meshsub/1.1.0"
+
+  @spec gossipsub_1_0() :: binary()
+  def gossipsub_1_0, do: "/meshsub/1.0.0"
 end

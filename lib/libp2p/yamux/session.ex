@@ -50,6 +50,7 @@ defmodule Libp2p.Yamux.Session do
   @ack 0x2
   @fin 0x4
   @rst 0x8
+  @initial_window_size 256 * 1024
 
   @type event ::
           {:stream_open, non_neg_integer()}
@@ -69,12 +70,7 @@ defmodule Libp2p.Yamux.Session do
   """
   @spec open_stream(t()) :: {non_neg_integer(), binary(), t()}
   def open_stream(%__MODULE__{} = st) do
-    id = st.next_stream_id
-    st = %{st | next_stream_id: id + 2, streams: Map.put(st.streams, id, stream_state(:outbound))}
-
-    # Open stream by sending a data frame with SYN (empty payload).
-    frame = %Frame{type: :data, flags: @syn, stream_id: id, data: <<>>}
-    {id, Frame.encode(frame) |> IO.iodata_to_binary(), st}
+    open_stream_with_data(st, <<>>)
   end
 
   @doc """
@@ -87,18 +83,21 @@ defmodule Libp2p.Yamux.Session do
   def open_stream_with_data(%__MODULE__{} = st, data) when is_binary(data) do
     id = st.next_stream_id
     st = %{st | next_stream_id: id + 2, streams: Map.put(st.streams, id, stream_state(:outbound))}
-    frame = %Frame{type: :data, flags: @syn, stream_id: id, data: data}
-    {id, Frame.encode(frame) |> IO.iodata_to_binary(), st}
+    {out, st} = send_new_stream_data(st, id, data)
+    {id, out, st}
   end
 
   @doc """
   Send data on an open stream. Returns `{out_bytes, st2}`.
   """
   @spec send_data(t(), non_neg_integer(), binary()) :: {binary(), t()}
-  def send_data(%__MODULE__{} = st, stream_id, data) when is_integer(stream_id) and is_binary(data) do
+  def send_data(%__MODULE__{} = st, stream_id, data)
+      when is_integer(stream_id) and is_binary(data) do
     _ = Map.fetch!(st.streams, stream_id)
-    frame = %Frame{type: :data, flags: 0, stream_id: stream_id, data: data}
-    {Frame.encode(frame) |> IO.iodata_to_binary(), st}
+
+    st = append_pending_send(st, stream_id, data)
+    {out, st} = flush_pending_send_bytes(st, stream_id)
+    {out, st}
   end
 
   @doc """
@@ -110,10 +109,11 @@ defmodule Libp2p.Yamux.Session do
       nil ->
         {<<>>, st}
 
-      s ->
-        st = %{st | streams: Map.put(st.streams, stream_id, Map.put(s, :local_closed, true))}
-        frame = %Frame{type: :data, flags: @fin, stream_id: stream_id, data: <<>>}
-        {Frame.encode(frame) |> IO.iodata_to_binary(), maybe_gc(stream_id, st)}
+      stream ->
+        stream = Map.put(stream, :pending_fin, true)
+        st = %{st | streams: Map.put(st.streams, stream_id, stream)}
+        {out, st} = flush_pending_send_bytes(st, stream_id)
+        {out, st}
     end
   end
 
@@ -166,43 +166,28 @@ defmodule Libp2p.Yamux.Session do
         ack = %Frame{type: :data, flags: @ack, stream_id: id, data: <<>>}
         events = [{:stream_open, id} | events]
         events = if f.data != <<>>, do: [{:stream_data, id, f.data} | events], else: events
-        {events, [Frame.encode(ack) | out], st}
+        out = [Frame.encode(ack) | out]
+        out = maybe_replenish_window(f, out)
+        st = maybe_handle_fin(st, id, flags)
+        events = if band(flags, @fin) != 0, do: [{:stream_close, id} | events], else: events
+        {events, out, st}
 
       band(flags, @ack) != 0 ->
         s = Map.get(st.streams, id, %{})
         st = %{st | streams: Map.put(st.streams, id, Map.put(s, :acked, true))}
         # ACK may be combined with a DATA frame (including payload and/or FIN).
-        {events, out} = maybe_emit_stream_data_and_window_update(events, out, id, f.data)
+        events = if f.data != <<>>, do: [{:stream_data, id, f.data} | events], else: events
+        out = maybe_replenish_window(f, out)
         st2 = maybe_handle_fin(st, id, flags)
         events = if band(flags, @fin) != 0, do: [{:stream_close, id} | events], else: events
         {events, out, st2}
 
       true ->
-        {events, out} = maybe_emit_stream_data_and_window_update(events, out, id, f.data)
+        events = if f.data != <<>>, do: [{:stream_data, id, f.data} | events], else: events
+        out = maybe_replenish_window(f, out)
         st2 = maybe_handle_fin(st, id, flags)
         events = if band(flags, @fin) != 0, do: [{:stream_close, id} | events], else: events
         {events, out, st2}
-    end
-  end
-
-  # Yamux flow control:
-  #
-  # Many production implementations enforce a per-stream send window (commonly 256KB initial).
-  # This session historically did not send `WINDOW_UPDATE` frames at all, which caused peers
-  # to stop sending mid-response once the window was exhausted (manifesting as truncated
-  # `ssz_snappy` payloads and decode errors).
-  #
-  # Simplest correct-enough approach: immediately credit back exactly what we receive.
-  # This treats inbound bytes as "consumed" as soon as we deliver them to the application.
-  defp maybe_emit_stream_data_and_window_update(events, out, stream_id, data)
-       when is_integer(stream_id) and is_binary(data) do
-    if data == <<>> do
-      {events, out}
-    else
-      n = byte_size(data)
-      # WindowUpdate: `length` is an in-header value (u32) representing additional credit.
-      wu = %Frame{type: :window_update, flags: 0, stream_id: stream_id, length: n}
-      {[{:stream_data, stream_id, data} | events], [Frame.encode(wu) | out]}
     end
   end
 
@@ -210,23 +195,32 @@ defmodule Libp2p.Yamux.Session do
     id = f.stream_id
     flags = f.flags || 0
 
-    {events, out, st} =
-      if Map.has_key?(st.streams, id) == false and band(flags, @syn) != 0 do
-        st = %{st | streams: Map.put(st.streams, id, stream_state(:inbound))}
-        # See comment above: ACK only, no window delta.
-        ack = %Frame{type: :window_update, flags: @ack, stream_id: id, length: 0}
-        events = [{:stream_open, id} | events]
-        {events, [Frame.encode(ack) | out], st}
-      else
-        {events, out, st}
-      end
+    cond do
+      band(flags, @rst) != 0 ->
+        st = %{st | streams: Map.delete(st.streams, id)}
+        {[{:stream_reset, id} | events], out, st}
 
-    if band(flags, @ack) != 0 do
-      s = Map.get(st.streams, id, %{})
-      st = %{st | streams: Map.put(st.streams, id, Map.put(s, :acked, true))}
-      {events, out, st}
-    else
-      {events, out, st}
+      true ->
+        {events, out, st} =
+          if Map.has_key?(st.streams, id) == false and band(flags, @syn) != 0 do
+            st = %{st | streams: Map.put(st.streams, id, stream_state(:inbound))}
+            # See comment above: ACK only, no window delta.
+            ack = %Frame{type: :window_update, flags: @ack, stream_id: id, length: 0}
+            events = [{:stream_open, id} | events]
+            {events, [Frame.encode(ack) | out], st}
+          else
+            {events, out, st}
+          end
+
+        st =
+          st
+          |> maybe_mark_acked(id, flags)
+          |> maybe_add_send_window(id, f.length)
+
+        st = maybe_handle_fin(st, id, flags)
+        events = if band(flags, @fin) != 0, do: [{:stream_close, id} | events], else: events
+        {flushed, st} = flush_pending_send(st, id, out)
+        {events, flushed, st}
     end
   end
 
@@ -241,10 +235,109 @@ defmodule Libp2p.Yamux.Session do
       {events, out, st}
     end
   end
+
   defp handle_frame(st, %Frame{type: :go_away} = f, events, out) do
     # Surface GOAWAY for diagnostics; callers may choose to close the connection.
     {[{:go_away, f.length} | events], out, st}
   end
+
+  defp send_new_stream_data(st, stream_id, <<>>) do
+    frame = %Frame{type: :data, flags: @syn, stream_id: stream_id, data: <<>>}
+    {Frame.encode(frame) |> IO.iodata_to_binary(), st}
+  end
+
+  defp send_new_stream_data(st, stream_id, data) do
+    case Map.fetch!(st.streams, stream_id) do
+      %{send_window: window} = stream when window > 0 ->
+        send_len = min(byte_size(data), window)
+        <<chunk::binary-size(send_len), rest::binary>> = data
+
+        stream =
+          stream
+          |> Map.put(:send_window, window - send_len)
+          |> Map.put(:pending_send, rest)
+
+        st = %{st | streams: Map.put(st.streams, stream_id, stream)}
+        frame = %Frame{type: :data, flags: @syn, stream_id: stream_id, data: chunk}
+        {Frame.encode(frame) |> IO.iodata_to_binary(), st}
+
+      stream ->
+        stream = Map.put(stream, :pending_send, data)
+        st = %{st | streams: Map.put(st.streams, stream_id, stream)}
+        frame = %Frame{type: :data, flags: @syn, stream_id: stream_id, data: <<>>}
+        {Frame.encode(frame) |> IO.iodata_to_binary(), st}
+    end
+  end
+
+  defp append_pending_send(st, stream_id, data) do
+    stream = Map.fetch!(st.streams, stream_id)
+    pending = Map.get(stream, :pending_send, <<>>)
+    stream = Map.put(stream, :pending_send, pending <> data)
+    %{st | streams: Map.put(st.streams, stream_id, stream)}
+  end
+
+  defp flush_pending_send_bytes(st, stream_id) do
+    {out, st} = flush_pending_send(st, stream_id, [])
+    {out |> Enum.reverse() |> IO.iodata_to_binary(), st}
+  end
+
+  defp flush_pending_send(st, stream_id, out) do
+    case Map.get(st.streams, stream_id) do
+      nil ->
+        {out, st}
+
+      %{pending_send: pending, send_window: window} = stream
+      when is_binary(pending) and byte_size(pending) > 0 and is_integer(window) and window > 0 ->
+        send_len = min(byte_size(pending), window)
+        <<chunk::binary-size(send_len), rest::binary>> = pending
+
+        stream =
+          stream
+          |> Map.put(:pending_send, rest)
+          |> Map.put(:send_window, window - send_len)
+
+        st = %{st | streams: Map.put(st.streams, stream_id, stream)}
+        frame = %Frame{type: :data, flags: 0, stream_id: stream_id, data: chunk}
+        flush_pending_send(st, stream_id, [Frame.encode(frame) | out])
+
+      %{pending_send: <<>>, pending_fin: true} = stream ->
+        stream =
+          stream
+          |> Map.put(:pending_fin, false)
+          |> Map.put(:local_closed, true)
+
+        st = %{st | streams: Map.put(st.streams, stream_id, stream)}
+        frame = %Frame{type: :data, flags: @fin, stream_id: stream_id, data: <<>>}
+        st = maybe_gc(stream_id, st)
+        {[Frame.encode(frame) | out], st}
+
+      _stream ->
+        {out, st}
+    end
+  end
+
+  defp maybe_mark_acked(st, id, flags) do
+    if band(flags, @ack) != 0 do
+      s = Map.get(st.streams, id, %{})
+      %{st | streams: Map.put(st.streams, id, Map.put(s, :acked, true))}
+    else
+      st
+    end
+  end
+
+  defp maybe_add_send_window(st, id, delta) when is_integer(delta) and delta > 0 do
+    case Map.get(st.streams, id) do
+      nil ->
+        st
+
+      stream ->
+        window = Map.get(stream, :send_window, @initial_window_size)
+        stream = Map.put(stream, :send_window, window + delta)
+        %{st | streams: Map.put(st.streams, id, stream)}
+    end
+  end
+
+  defp maybe_add_send_window(st, _id, _delta), do: st
 
   defp maybe_handle_fin(st, id, flags) do
     if band(flags, @fin) != 0 do
@@ -256,6 +349,19 @@ defmodule Libp2p.Yamux.Session do
       st
     end
   end
+
+  # Yamux flow control:
+  #
+  # Many production implementations enforce a per-stream send window (commonly 256KB initial).
+  # This session immediately credits back exactly what it receives, treating inbound bytes as
+  # consumed when delivered to the application.
+  defp maybe_replenish_window(%Frame{stream_id: id, data: data}, out)
+       when is_binary(data) and byte_size(data) > 0 do
+    update = %Frame{type: :window_update, flags: 0, stream_id: id, length: byte_size(data)}
+    [Frame.encode(update) | out]
+  end
+
+  defp maybe_replenish_window(_frame, out), do: out
 
   defp maybe_gc(id, st) do
     s = Map.get(st.streams, id)
@@ -272,7 +378,10 @@ defmodule Libp2p.Yamux.Session do
       dir: dir,
       acked: dir == :inbound,
       local_closed: false,
-      remote_closed: false
+      remote_closed: false,
+      send_window: @initial_window_size,
+      pending_send: <<>>,
+      pending_fin: false
     }
   end
 

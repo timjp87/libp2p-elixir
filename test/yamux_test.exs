@@ -23,12 +23,41 @@ defmodule Libp2p.YamuxTest do
 
     {events_b1, out_b1, b} = Session.feed(b, out_a1)
     assert {:stream_open, sid} in events_b1
-    assert out_b1 != <<>> # ACK
+    # ACK
+    assert out_b1 != <<>>
 
     {_events_a1, _out_a1b, a} = Session.feed(a, out_b1)
 
     {out_a2, _a} = Session.send_data(a, sid, "hello")
     {events_b2, _out_b2, _b} = Session.feed(b, out_a2)
     assert {:stream_data, sid, "hello"} in events_b2
+  end
+
+  test "outbound data waits for peer window credit before sending past initial window" do
+    a = Session.new(:client)
+    b = Session.new(:server)
+
+    {sid, out_a1, a} = Session.open_stream(a)
+    {_events_b1, out_b1, _b} = Session.feed(b, out_a1)
+    {_events_a1, _out_a1b, a} = Session.feed(a, out_b1)
+
+    payload = :binary.copy("a", 262_144) <> "tail"
+    {out_a2, a} = Session.send_data(a, sid, payload)
+
+    {%Frame{type: :data, stream_id: ^sid, data: first_chunk}, <<>>} =
+      Frame.decode_one(out_a2)
+
+    assert byte_size(first_chunk) == 262_144
+    refute first_chunk =~ "tail"
+
+    grant =
+      %Frame{type: :window_update, flags: 0, stream_id: sid, length: 4}
+      |> Frame.encode()
+      |> IO.iodata_to_binary()
+
+    {_events_a2, out_a3, _a} = Session.feed(a, grant)
+
+    assert {%Frame{type: :data, stream_id: ^sid, data: "tail"}, <<>>} =
+             Frame.decode_one(out_a3)
   end
 end

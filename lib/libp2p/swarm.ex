@@ -78,6 +78,8 @@ defmodule Libp2p.Swarm do
       streams: %{},
       protocol_handlers: protocol_handlers,
       gossipsub: Keyword.get(opts, :gossipsub, nil),
+      stream_task_supervisor:
+        Keyword.get(opts, :stream_task_supervisor, Libp2p.RpcStreamSupervisor),
       # Optional extra process to notify when a connection becomes ready (yamux).
       # This is used by downstream apps (e.g. Panacea) to kick off Status handshakes
       # without having to make the Swarm the handler/owner.
@@ -152,7 +154,7 @@ defmodule Libp2p.Swarm do
 
     # We monitor the task to clean up streams map when it exits
     {:ok, pid} =
-      Task.Supervisor.start_child(Libp2p.RpcStreamSupervisor, fn ->
+      Task.Supervisor.start_child(st.stream_task_supervisor, fn ->
         # Take ownership directly to bypass Swarm for future data
         try do
           Libp2p.ConnectionV2.set_stream_handler(conn, stream_id, self())

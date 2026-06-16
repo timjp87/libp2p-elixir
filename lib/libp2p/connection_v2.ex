@@ -68,6 +68,15 @@ defmodule Libp2p.ConnectionV2 do
     end
   end
 
+  @spec role(pid(), timeout()) :: {:ok, role()} | {:error, term()}
+  def role(conn, timeout \\ 5_000) do
+    try do
+      :gen_statem.call(conn, :role, timeout)
+    catch
+      :exit, reason -> {:error, reason}
+    end
+  end
+
   @spec await_ready(pid(), timeout()) :: :ok | {:error, term()}
   def await_ready(conn, timeout \\ 20_000) do
     :gen_statem.call(conn, :await_ready, timeout)
@@ -375,6 +384,11 @@ defmodule Libp2p.ConnectionV2 do
   @impl :gen_statem
   def handle_event({:call, from}, :remote_peer_id, _state, data) do
     {:keep_state, data, [{:reply, from, {:ok, data.remote_peer_id}}]}
+  end
+
+  @impl :gen_statem
+  def handle_event({:call, from}, :role, _state, data) do
+    {:keep_state, data, [{:reply, from, {:ok, data.role}}]}
   end
 
   @impl :gen_statem
